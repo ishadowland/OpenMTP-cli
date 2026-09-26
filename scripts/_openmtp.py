@@ -21,6 +21,7 @@ import re
 import selectors
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -905,11 +906,15 @@ class MTPSession:
         self.path = mtp_cli_path
         self.quiet_gap = quiet_gap
         self.connect_timeout = connect_timeout
+        # stderr goes to a temp file: get/put transfers can emit IOKit noise
+        # on stderr, and we want it available for diagnostics without risking
+        # a PIPE-buffer deadlock or polluting the stdout stream we parse.
+        self._stderr_file = tempfile.TemporaryFile(mode="w+")
         self.proc = subprocess.Popen(
             [str(mtp_cli_path), "-b", *extra_args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._stderr_file,
             text=True,
             bufsize=1,
         )
@@ -965,6 +970,65 @@ class MTPSession:
             raise RuntimeError(f"mtp-cli died while running {command!r}")
         return lines
 
+    def run_transfer(
+        self,
+        command: str,
+        *,
+        timeout: float = 120.0,
+        probe: str = "pwd",
+    ) -> list[str]:
+        """Run a silent command (``get`` / ``put``) and detect completion.
+
+        Transfers produce no stdout, so the quiet-gap heuristic cannot tell
+        "still transferring" from "finished". Instead we queue a probe
+        command (``pwd`` by default) right after the transfer command: mtp-cli
+        processes stdin strictly in order, so the FIRST stdout line received
+        after queuing is the probe's response — meaning the transfer finished.
+
+        Returns the probe's output lines (empty strings filtered out) plus
+        anything the transfer itself printed (usually nothing, or an error).
+
+        Raises ``TimeoutError`` if the probe never responds within
+        ``timeout`` seconds — the transfer (or the session) is stuck; the
+        caller should abandon this session.
+        """
+        if self.proc.poll() is not None:
+            raise RuntimeError(f"mtp-cli session exited early (code {self.proc.returncode})")
+        self.proc.stdin.write(command + "\n")
+        self.proc.stdin.write(probe + "\n")
+        self.proc.stdin.flush()
+
+        lines: list[str] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            events = self._sel.select(0.2)
+            for key, _ in events:
+                line = key.fileobj.readline()
+                if line and line.strip():
+                    lines.append(line.rstrip("\n"))
+            if lines:
+                # First non-empty output = the probe responded → done.
+                return lines
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"mtp-cli died (code {self.proc.returncode}) while running {command!r}"
+                )
+        raise TimeoutError(
+            f"{command.split()[0] if command.split() else command} did not complete "
+            f"within {timeout}s (probe {probe!r} never responded)"
+        )
+
+    def stderr_tail(self, chars: int = 2000) -> str:
+        """Return the last ``chars`` characters written to stderr so far."""
+        try:
+            self._stderr_file.flush()
+            self._stderr_file.seek(0, 2)  # seek end
+            size = self._stderr_file.tell()
+            self._stderr_file.seek(max(0, size - chars))
+            return self._stderr_file.read()
+        except (OSError, ValueError):
+            return ""
+
     def close(self) -> None:
         try:
             if self.proc.poll() is None:
@@ -980,6 +1044,10 @@ class MTPSession:
                     self.proc.wait(timeout=2)
         finally:
             self._sel.close()
+            try:
+                self._stderr_file.close()
+            except (OSError, ValueError):
+                pass
 
 
 # -----------------------------------------------------------------------------

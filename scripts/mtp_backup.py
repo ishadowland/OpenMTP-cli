@@ -88,52 +88,79 @@ def _rel_from_root(path: str, src_root: str) -> str:
     return p  # fallback — tree may not have started at src_root exactly
 
 
-def copy_one(
+def _quote_path(p: str) -> str:
+    """Quote a device or local path for mtp-cli if it contains spaces."""
+    return f'"{p}"' if " " in p else p
+
+
+def copy_files_via_session(
+    file_plan: list[dict],
     *,
-    src_path: str,
-    local_dst: Path,
     mtp_cli_path: Path,
     overwrite: bool,
-    timeout: float,
-) -> dict:
-    """Run a single ``mtp-cli get`` to copy ``src_path`` to ``local_dst``.
+    file_timeout: float,
+    copied: list[dict],
+    skipped: list[dict],
+    errors: list[dict],
+) -> None:
+    """Copy every file in ``file_plan`` over ONE persistent mtp-cli session.
 
-    Returns a result dict suitable for the ``copied`` / ``skipped`` / ``errors``
-    list in the final JSON.
+    Per-invocation `get` processes would claim/release the USB interface per
+    file — the exact pattern that wedges the OnePlus MTP daemon (issue #2).
+    A single session claims once. If a transfer times out (device stall),
+    the session is abandoned and a fresh one is opened; the remaining files
+    continue.
+
+    Appends result dicts to ``copied`` / ``skipped`` / ``errors``.
     """
-    if local_dst.exists() and not overwrite:
-        return {"src": src_path, "dst": str(local_dst), "skipped": True, "reason": "exists"}
+    session = om.MTPSession(mtp_cli_path)
+    try:
+        for entry in file_plan:
+            src_path = entry["src"]
+            local_dst = Path(entry["dst"])
 
-    local_dst.parent.mkdir(parents=True, exist_ok=True)
-    started = time.monotonic()
-    result = om.run_mtp(
-        [f"get {src_path} {local_dst}"],
-        mtp_cli_path=mtp_cli_path,
-        timeout=timeout,
-    )
-    elapsed_ms = int((time.monotonic() - started) * 1000)
+            if local_dst.exists() and not overwrite:
+                skipped.append({"src": src_path, "dst": str(local_dst), "skipped": True, "reason": "exists"})
+                continue
 
-    if result.timed_out:
-        return {"src": src_path, "dst": str(local_dst), "error": f"mtp-cli timed out after {timeout}s"}
-    if result.exit_code != 0:
-        return {
-            "src": src_path,
-            "dst": str(local_dst),
-            "error": f"mtp-cli exit {result.exit_code}",
-            "stderr": result.stderr.strip()[-500:],
-        }
-    if not local_dst.exists():
-        return {
-            "src": src_path,
-            "dst": str(local_dst),
-            "error": "mtp-cli reported success but file is not on disk",
-        }
-    return {
-        "src": src_path,
-        "dst": str(local_dst),
-        "size": local_dst.stat().st_size,
-        "took_ms": elapsed_ms,
-    }
+            local_dst.parent.mkdir(parents=True, exist_ok=True)
+            started = time.monotonic()
+            cmd = f"get {_quote_path(src_path)} {_quote_path(str(local_dst))}"
+            try:
+                session.run_transfer(cmd, timeout=file_timeout)
+            except TimeoutError as e:
+                errors.append({
+                    "src": src_path,
+                    "dst": str(local_dst),
+                    "error": str(e),
+                    "stderr": session.stderr_tail(500),
+                })
+                # Session is unreliable after a stalled transfer — rebuild.
+                session.close()
+                session = om.MTPSession(mtp_cli_path)
+                continue
+            except (RuntimeError, OSError) as e:
+                errors.append({"src": src_path, "dst": str(local_dst), "error": str(e)})
+                session.close()
+                session = om.MTPSession(mtp_cli_path)
+                continue
+
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if not local_dst.exists():
+                errors.append({
+                    "src": src_path,
+                    "dst": str(local_dst),
+                    "error": "mtp-cli reported success but file is not on disk",
+                })
+                continue
+            copied.append({
+                "src": src_path,
+                "dst": str(local_dst),
+                "size": local_dst.stat().st_size,
+                "took_ms": elapsed_ms,
+            })
+    finally:
+        session.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -284,20 +311,15 @@ def main(argv: list[str] | None = None) -> int:
             "errors": errors,
         }
     else:
-        for entry in file_plan:
-            r = copy_one(
-                src_path=entry["src"],
-                local_dst=Path(entry["dst"]),
-                mtp_cli_path=mtp_cli_path,
-                overwrite=args.overwrite,
-                timeout=args.file_timeout,
-            )
-            if "skipped" in r:
-                skipped.append(r)
-            elif "error" in r:
-                errors.append(r)
-            else:
-                copied.append(r)
+        copy_files_via_session(
+            file_plan,
+            mtp_cli_path=mtp_cli_path,
+            overwrite=args.overwrite,
+            file_timeout=args.file_timeout,
+            copied=copied,
+            skipped=skipped,
+            errors=errors,
+        )
         result = {
             "dry_run": False,
             "src": args.src,
