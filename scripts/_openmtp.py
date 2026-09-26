@@ -472,6 +472,27 @@ _LSEXT_LINE_LOOSE_RE = re.compile(
     r"object[ \t]+id:[ \t]+(?P<oid>0x[0-9A-Fa-f]+)", re.IGNORECASE
 )
 
+# The bundled mtp-cli v3.9-2 (android-file-transfer-linux) emits lsext /
+# lsext-r output as FIXED-COLUMN positional values rather than the
+# colon-prefixed form. Columns are whitespace-separated; the name is
+# everything from the mtime timestamp to end of line:
+#
+#     <object_id>  <storage_id>  <format_hex>  <size>  <mtime>  <name>
+#
+# Example (verbatim from issue #2):
+#     8          65537      3001          0 2026-09-24 18:52:03  Pictures
+#
+# mtime has a space (date + time), so we anchor the trailing fields.
+_LSEXT_LINE_POSITIONAL_RE = re.compile(
+    r"^\s*"
+    r"(?P<oid>\d+)\s+"
+    r"(?P<parent_storage>\d+)\s+"
+    r"(?P<fmt>[0-9A-Fa-f]+)\s+"
+    r"(?P<size>\d+)\s+"
+    r"(?P<mtime>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"
+    r"(?P<name>.+?)\s*$"
+)
+
 _STORAGE_LINE_RE = re.compile(
     r"Storage:[ \t]*(?P<id>0x[0-9A-Fa-f]+)[ \t]+(?P<desc>.+?)(?:[ \t]+(?P<free>[\d.]+)\s*(?P<free_unit>[KMGT]?B)[ \t]+free[ \t]*/[ \t]*(?P<total>[\d.]+)\s*(?P<total_unit>[KMGT]?B)[ \t]+total)?\s*$",
     re.IGNORECASE,
@@ -552,8 +573,17 @@ class TreeNode:
 def parse_lsext(output: str) -> list[TreeNode]:
     """Parse the output of an ``lsext`` or ``lsext-r`` command.
 
-    The parser returns nodes with object ids, sizes, and formats but without
-    resolved paths. Callers should compose paths via :func:`attach_paths`.
+    Supports two formats:
+      1. ``object id: 0x.., parent: 0x.., name: ..., type: folder|file,
+         size: N, mtime: ..., mtp object format = 0x..`` (some mtp-cli
+         builds / help-text examples).
+      2. Fixed-column positional:
+         ``<object_id>  <storage_id>  <format_hex>  <size>  <mtime>  <name>``
+         (the v3.9-2 build bundled with OpenMTP.app).
+
+    The parser returns nodes with object ids, sizes, and formats but
+    without resolved paths. Callers should compose paths via
+    :func:`attach_paths`.
     """
     nodes: list[TreeNode] = []
     for line in output.splitlines():
@@ -561,31 +591,62 @@ def parse_lsext(output: str) -> list[TreeNode]:
         if not line:
             continue
         m = _LSEXT_LINE_RE.match(line)
-        if not m:
-            # Try the loose matcher to skip header/footer lines cleanly.
-            if not _LSEXT_LINE_LOOSE_RE.search(line):
-                continue
-            continue
-        oid = int(m.group("oid"), 16)
-        parent = int(m.group("parent"), 16)
-        name = m.group("name").strip()
-        is_dir = m.group("type").lower() == "folder"
-        size = int(m.group("size"))
-        mtime = m.group("mtime")
-        fmt = int(m.group("fmt"), 16)
-        nodes.append(
-            TreeNode(
-                object_id=oid,
-                parent_id=parent,
-                name=name,
-                is_dir=is_dir,
-                size=size,
-                mtime=mtime,
-                format_code=fmt,
-                mime=mime_for_code(fmt),
-                category=category_for_code(fmt),
+        if m:
+            oid = int(m.group("oid"), 16)
+            parent = int(m.group("parent"), 16)
+            name = m.group("name").strip()
+            is_dir = m.group("type").lower() == "folder"
+            size = int(m.group("size"))
+            mtime = m.group("mtime")
+            fmt = int(m.group("fmt"), 16)
+            nodes.append(
+                TreeNode(
+                    object_id=oid,
+                    parent_id=parent,
+                    name=name,
+                    is_dir=is_dir,
+                    size=size,
+                    mtime=mtime,
+                    format_code=fmt,
+                    mime=mime_for_code(fmt),
+                    category=category_for_code(fmt),
+                )
             )
-        )
+            continue
+
+        m = _LSEXT_LINE_POSITIONAL_RE.match(line)
+        if m:
+            oid = int(m.group("oid"))          # decimal in this format
+            parent_storage = int(m.group("parent_storage"))
+            name = m.group("name").strip()
+            fmt = int(m.group("fmt"), 16)      # bare hex, no 0x prefix
+            size = int(m.group("size"))
+            mtime = m.group("mtime")
+            is_dir = (fmt == MTP_FORMAT_ASSOCIATION)
+            nodes.append(
+                TreeNode(
+                    object_id=oid,
+                    parent_id=parent_storage,  # we don't have a true parent_id here; storage_id is the closest
+                    name=name,
+                    is_dir=is_dir,
+                    size=size,
+                    mtime=mtime,
+                    format_code=fmt,
+                    mime=mime_for_code(fmt),
+                    category=category_for_code(fmt),
+                )
+            )
+            continue
+
+        # Skip libmtp / IOKit noise lines; do not silently lose data
+        # otherwise, but log if a hard test wants to assert the count.
+        if _LSEXT_LINE_LOOSE_RE.search(line):
+            continue
+        if any(line.startswith(p) for p in _NOISE_PREFIXES):
+            continue
+        # Unrecognised non-empty line — drop silently (matches the old
+        # behaviour; the caller can still inspect raw stdout via the
+        # mtp-tree --no-json path or by piping).
     return nodes
 
 
@@ -804,8 +865,216 @@ def filter_nodes(
 
 
 # -----------------------------------------------------------------------------
-# Misc formatting
+# Tree walk (non-recursive workaround)
 # -----------------------------------------------------------------------------
+#
+# On OnePlus 12 (and likely other OPPO-derived devices), ``lsext-r <path>``
+# (and ``ls -r``) hang indefinitely. The device returns the first few
+# entries on stdout, then mtp-cli sits waiting for the next GetObjectHandles
+# response that never comes — eventually leaving the USB interface in a
+# half-claimed state that breaks every subsequent mtp-cli invocation until
+# ``sudo killall -HUP usbd`` resets the macOS USB daemon. Reproduced on
+# macOS 13.6 with the mtp-cli v3.9-2 build bundled with OpenMTP.app 3.3.0;
+# documented in issue #2.
+#
+# The workaround is to drive the recursion from the wrapper, calling the
+# KNOWN-WORKING non-recursive ``lsext <path>`` once per directory. Each
+# invocation is small enough that the OnePlus MTP state machine can answer
+# without hanging. Total wall time scales with directory count
+# (≈ 1 subprocess + 1 mtp-cli startup per subdirectory) but is bounded
+# and predictable. Pass ``recursive=True`` to fall back to ``lsext-r`` (fast
+# on devices that work; hangs on OnePlus).
+#
+# The returned :class:`TreeNode` list has ``path`` set to a slash-separated
+# path RELATIVE TO THE DEVICE ROOT, matching what :func:`attach_paths` does
+# for a single ``lsext-r`` call. Callers can feed the list straight to
+# ``json.dumps`` after ``to_dict()``-ing each node.
+
+import fnmatch as _fnmatch
+
+
+def walk_tree(
+    path: str,
+    *,
+    mtp_cli_path: Path,
+    timeout: float,
+    retries_on_hang: int = 0,
+    max_depth: Optional[int] = None,
+    format_filter: Optional[str] = None,
+    include: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+    recursive: bool = False,
+    run_fn: Optional[Any] = None,
+) -> tuple[list[TreeNode], list[str]]:
+    """Walk a directory tree via per-directory ``lsext`` invocations.
+
+    Returns ``(nodes, errors)`` where ``nodes`` is a pre-order list of
+    :class:`TreeNode` entries (with ``path`` populated) and ``errors`` is a
+    list of human-readable strings for subdirectories that timed out or
+    errored during the walk — the caller decides whether to surface them.
+
+    ``recursive=True`` calls ``lsext-r <path>`` ONCE and returns its
+    result. Use this only on devices where the recursive call is known to
+    work (anything that isn't OnePlus-derived). On OnePlus the recursive
+    call hangs, the wrapper's timeout will eventually fire, and the
+    partial stdout is preserved in the result so the user sees what was
+    collected before the hang.
+    """
+    run = run_fn if run_fn is not None else run_mtp
+    errors: list[str] = []
+
+    # Single recursive call (fast path on non-OnePlus devices).
+    if recursive:
+        cmd = ["lsext-r"] if path in ("", "/") else [f"lsext-r {path}"]
+        result = run(cmd, mtp_cli_path=mtp_cli_path, timeout=timeout, retries_on_hang=retries_on_hang)
+        if result.timed_out:
+            # Try to salvage whatever stdout was buffered before the hang.
+            # mtp-cli buffers stdout and only writes when it flushes, so
+            # partial output here is usually only a few lines — but it's
+            # better than nothing.
+            partial = parse_lsext(result.stdout)
+            if partial:
+                attached = attach_paths(partial)
+                return (
+                    _apply_filters(attached, max_depth=max_depth, format_filter=format_filter,
+                                   include=include, exclude=exclude),
+                    [f"lsext-r {path} timed out after {timeout}s; partial result returned"],
+                )
+            errors.append(f"lsext-r {path} timed out after {timeout}s (no partial output)")
+            return [], errors
+        nodes = parse_lsext(result.stdout)
+        if not nodes:
+            errors.append(f"lsext-r {path} returned no entries")
+            return [], errors
+        attached = attach_paths(nodes)
+        return (
+            _apply_filters(attached, max_depth=max_depth, format_filter=format_filter,
+                           include=include, exclude=exclude),
+            errors,
+        )
+
+    # Manual DFS via non-recursive lsext <path> per directory. The output
+    # of `lsext <path>` is the children of <path>; mtp-cli does NOT echo
+    # the directory itself. We use that contract to avoid re-listing the
+    # root node at every level.
+    all_nodes: list[TreeNode] = []
+
+    def _walk(current_path: str, current_depth: int) -> None:
+        cmd = ["lsext"] if current_path in ("", "/") else [f"lsext {current_path}"]
+        result = run(cmd, mtp_cli_path=mtp_cli_path, timeout=timeout, retries_on_hang=retries_on_hang)
+        if result.timed_out:
+            errors.append(f"lsext {current_path} timed out after {timeout}s")
+            return
+        children = parse_lsext(result.stdout)
+        # Skip the directory node itself if mtp-cli echoed it. The bundled
+        # build does NOT echo ``<path>`` itself for `lsext <path>`, only
+        # for `lsext` (no path). Be defensive: drop any returned node with
+        # parent_id == 0xFFFFFFFF (root marker).
+        children = [n for n in children if n.parent_id != 0xFFFFFFFF]
+        # Set path on each child.
+        for n in children:
+            if current_path in ("", "/"):
+                n.path = n.name
+            else:
+                n.path = f"{current_path}/{n.name}"
+        all_nodes.extend(children)
+        # Recurse into subdirectories only if max_depth allows.
+        # ``max_depth=N`` means: include items at depths 1..N. We are at
+        # ``current_depth`` (root listing = depth 0; DCIM listing = depth 1).
+        # To include DCIM's children, recurse from depth 1 to depth 2.
+        # Recursion condition: max_depth > current_depth + 1, i.e. the
+        # children at depth current_depth+1 fit within max_depth.
+        if max_depth is None or max_depth > current_depth + 1:
+            for n in children:
+                if n.is_dir:
+                    _walk(n.path, current_depth + 1)
+
+    _walk(path, 0)
+
+    return _apply_filters(all_nodes, max_depth=None, format_filter=format_filter,
+                          include=include, exclude=exclude), errors
+
+
+def _apply_filters(
+    nodes: Sequence[TreeNode],
+    *,
+    max_depth: Optional[int],
+    format_filter: Optional[str],
+    include: Sequence[str],
+    exclude: Sequence[str],
+) -> list[TreeNode]:
+    """Depth + include/exclude/category filter, applied to a flat node list.
+
+    depth_of(path) counts the segments between slashes; root is depth 1.
+    max_depth is the *inclusive* max (--depth 1 = root only, --depth 2 =
+    root + its immediate children).
+    """
+    if not nodes:
+        return []
+
+    # Depth filter first.
+    if max_depth is not None:
+        kept: list[TreeNode] = []
+        for n in nodes:
+            d = 0 if n.path == "" else n.path.count("/") + 1
+            if d <= max_depth:
+                kept.append(n)
+        nodes = kept
+
+    # Include/exclude (file-level).
+    if include or exclude:
+        out: list[TreeNode] = []
+        for n in nodes:
+            if n.is_dir:
+                out.append(n)
+                continue
+            if include and not any(_fnmatch.fnmatch(n.name, p) for p in include):
+                continue
+            if exclude and any(_fnmatch.fnmatch(n.name, p) for p in exclude):
+                continue
+            out.append(n)
+        nodes = out
+
+    # Format filter — keep matching files; keep folders that contain
+    # at least one matching descendant.
+    if format_filter and format_filter != "all":
+        target = category_for_code_to_category(format_filter)
+        if target != "all":
+            children_by_parent: dict[int, list[TreeNode]] = {}
+            for n in nodes:
+                children_by_parent.setdefault(n.parent_id, []).append(n)
+
+            def file_matches(n: TreeNode) -> bool:
+                return (not n.is_dir) and _node_category(n) == target
+
+            def folder_has_match(n: TreeNode) -> bool:
+                for child in children_by_parent.get(n.object_id, []):
+                    if child.is_dir:
+                        if folder_has_match(child):
+                            return True
+                    elif file_matches(child):
+                        return True
+                return False
+
+            nodes = [n for n in nodes
+                     if (not n.is_dir and file_matches(n))
+                     or (n.is_dir and folder_has_match(n))]
+
+    return nodes
+
+
+def _node_category(n: TreeNode) -> str:
+    """Category for a TreeNode, computed from its format_code."""
+    return category_for_code(n.format_code)
+
+
+def category_for_code_to_category(value: str) -> str:
+    """Normalize a --format-filter string to a category name.
+
+    Exposed as a separate function so tests can import it without depending
+    on the unexported ``_normalize_filter``.
+    """
+    return normalize_filter(value)
 
 def _fmt_bytes(n: int) -> str:
     """Human-readable byte count (1.2 MB, 3.4 GB, ...)."""

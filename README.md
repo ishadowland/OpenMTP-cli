@@ -131,8 +131,30 @@ Flags:
 | `--path` | `/` | Directory on the device. |
 | `--depth` | unbounded | 1 = root only, 2 = root + immediate children, ... |
 | `--format-filter` | none | `image` / `video` / `audio` / `document` / `all` plus loose aliases (`photo`, `music`, MIME prefixes). |
-| `--timeout` | `10` | Seconds for the mtp-cli response. |
+| `--timeout` | `10` | Seconds per `lsext <dir>` call. Recursive walks multiply this by subdirectory count. |
+| `--use-recursive` | **off** | Use `lsext-r <path>` (single recursive call) instead of the wrapper's manual DFS. **Faster on devices that support it, but hangs on OnePlus 12 and similar OPPO-derived devices.** Default is the safe option. |
+| `--retry-on-hang N` | 0 | If `lsext` hangs, kill mtp-cli, wait, retry up to N times. |
 | `--no-json` | off | Human-readable text instead of JSON. |
+
+#### Why manual DFS by default
+
+The bundled `mtp-cli` (v3.9-2, an `android-file-transfer-linux` fork)
+shells out to `lsext-r` for recursive directory listings. On OnePlus 12
+(and likely other OPPO-derived phones), `lsext-r` returns the first few
+entries on stdout then **hangs forever** — the device's MTP state machine
+stops answering GetObjectHandles for the recursive subtree. mtp-cli's hang
+leaves the USB interface in a half-claimed state that breaks every
+subsequent mtp-cli invocation until `sudo killall -HUP usbd` resets the
+macOS USB daemon.
+
+To avoid this, `mtp-tree` defaults to a manual DFS: one non-recursive
+`lsext <path>` invocation per directory, recursing from the wrapper. Each
+call returns quickly (proven to work on OnePlus 12); total wall time is
+slightly higher than a single `lsext-r` would be on a working device but
+predictable and bounded.
+
+Pass `--use-recursive` to opt back into a single `lsext-r` call. The
+wrapper will use the partial stdout if `lsext-r` hangs.
 
 ### `mtp-backup`
 

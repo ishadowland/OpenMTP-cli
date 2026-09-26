@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""mtp-tree — recursively list a directory on the connected MTP device.
+"""mtp-tree — list a directory on the connected MTP device.
+
+By default, the wrapper drives a manual DFS via per-directory non-recursive
+``lsext <path>`` invocations. This is the safe mode that works on OnePlus 12
+(where ``lsext-r`` hangs and corrupts the USB stack — see issue #2). Pass
+``--use-recursive`` to opt back into a single ``lsext-r`` call for devices
+that support native recursive listing without hanging.
 
 Returns a JSON array of nodes with file-type metadata (MTP ObjectFormatCode +
 inferred MIME + category). Folder nodes are kept when they contain at least
@@ -11,74 +17,15 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _openmtp as om  # noqa: E402
 
 
-def depth_of(path: str) -> int:
-    """Return the depth of ``path``: 1 for the tree root, 2 for its children, etc.
-
-    For a tree rooted at ``DCIM``, depth 1 = ``DCIM``, depth 2 = ``DCIM/Camera``,
-    depth 3 = ``DCIM/Camera/IMG.jpg``.
-    """
-    return path.count("/") + 1
-
-
-def apply_filters(
-    nodes: list[om.TreeNode],
-    *,
-    max_depth: Optional[int],
-    format_filter: Optional[str],
-) -> list[om.TreeNode]:
-    """Apply depth + category filters. Returns nodes in pre-order."""
-    # Depth filter — pre-order walk guarantees parents precede children, so
-    # truncating at the first too-deep node also drops its descendants.
-    if max_depth is not None:
-        kept: list[om.TreeNode] = []
-        for n in nodes:
-            if depth_of(n.path) <= max_depth:
-                kept.append(n)
-            else:
-                break
-        nodes = kept
-
-    if not format_filter or format_filter == "all":
-        return nodes
-
-    target = om.normalize_filter(format_filter)
-    if target == "all":
-        return nodes
-
-    # Category filter: keep file nodes matching the target; keep folder nodes
-    # only if they have at least one matching file descendant.
-    children_by_parent: dict[int, list[om.TreeNode]] = {}
-    for n in nodes:
-        children_by_parent.setdefault(n.parent_id, []).append(n)
-
-    def file_matches(n: om.TreeNode) -> bool:
-        return (not n.is_dir) and n.category == target
-
-    def folder_has_match(n: om.TreeNode) -> bool:
-        for child in children_by_parent.get(n.object_id, []):
-            if child.is_dir:
-                if folder_has_match(child):
-                    return True
-            elif file_matches(child):
-                return True
-        return False
-
-    return [
-        n for n in nodes
-        if (not n.is_dir and file_matches(n)) or (n.is_dir and folder_has_match(n))
-    ]
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="mtp-tree",
-        description="Recursively list a directory on the connected MTP device.",
+        description="List a directory on the connected MTP device (manual DFS by default).",
     )
     parser.add_argument(
         "--path",
@@ -118,6 +65,15 @@ def main(argv: list[str] | None = None) -> int:
              "and retry up to N times before giving up. Default: 0.",
     )
     parser.add_argument(
+        "--use-recursive",
+        action="store_true",
+        help="Use mtp-cli's native `lsext-r` (single recursive call) instead "
+             "of the wrapper's manual DFS via per-directory `lsext <path>`. "
+             "Faster on devices that support recursive listing natively, "
+             "but **hangs on OnePlus 12** and similar OPPO-derived devices. "
+             "Default: false (manual DFS, the safe option).",
+    )
+    parser.add_argument(
         "--no-json",
         action="store_true",
         help="Print human-readable text instead of JSON.",
@@ -129,57 +85,45 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError as e:
         om.die(str(e), code=1)
 
-    # mtp-cli's ``lsext-r <path>`` will recurse from <path>. ``cd`` is not
-    # needed; we pass the path directly. If --path is ``"/"`` we omit it to
-    # list the device root.
-    commands = ["lsext-r"] if args.path in ("/", "") else [f"lsext-r {args.path}"]
-    result = om.run_mtp(
-        commands,
+    nodes, errors = om.walk_tree(
+        args.path,
         mtp_cli_path=mtp_cli_path,
         timeout=args.timeout,
         retries_on_hang=max(0, args.retry_on_hang),
-    )
-
-    if result.timed_out:
-        om.die(
-            f"mtp-cli did not respond within {args.timeout}s after "
-            f"{result.attempts} attempt(s) "
-            f"(last_command={result.last_command!r}).\n"
-            + om.hang_recovery_hint(result),
-            code=1,
-        )
-
-    nodes = om.parse_lsext(result.stdout)
-    if not nodes:
-        # The wrapper has the list but it was empty — could mean path
-        # doesn't exist, OR the listing produced output the parser didn't
-        # recognise. Surface the raw stdout tail so the user can see what
-        # mtp-cli actually emitted.
-        tail = result.stdout.strip()[-500:]
-        om.die(
-            f"no entries returned for path {args.path!r}. Check that the path "
-            f"exists and that the device is unlocked. Raw mtp-cli output "
-            f"(last 500 chars):\n{tail}",
-            code=1,
-        )
-
-    nodes = om.attach_paths(nodes)
-    nodes = apply_filters(
-        nodes,
         max_depth=args.depth,
         format_filter=args.format_filter,
+        recursive=args.use_recursive,
     )
 
+    if not nodes and not errors:
+        om.die(
+            f"no entries returned for path {args.path!r}. Check that the path "
+            f"exists and that the device is unlocked. If you passed "
+            f"--use-recursive on a OnePlus, drop the flag — the recursive "
+            f"listing hangs on that device.",
+            code=1,
+        )
+
     if args.no_json:
+        if errors:
+            print("# Errors during walk:", file=sys.stderr)
+            for e in errors:
+                print(f"  - {e}", file=sys.stderr)
         for n in nodes:
             if n.is_dir:
                 print(f"{n.path}/  ({n.object_id:#x})")
             else:
                 size = om._fmt_bytes(n.size)
                 print(f"{n.path}  [{n.category}] {size}  ({n.mime}, {n.format_code:#x})")
-        return 0
+        return 0 if not errors else 1
 
-    om.emit_json([n.to_dict() for n in nodes])
+    payload = [n.to_dict() for n in nodes]
+    if errors:
+        # Embed the errors as a sidecar field; JSON consumers that expect
+        # a pure array can ignore it. Use a single-key envelope for safety.
+        om.emit_json({"nodes": payload, "warnings": errors})
+        return 0 if payload else 1
+    om.emit_json(payload)
     return 0
 
 
