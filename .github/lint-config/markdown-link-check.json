@@ -1,0 +1,17 @@
+{
+  "ignorePatterns": [
+    {
+      "pattern": "^https://github.com/ishadowland/openmtp-cli/(issues|discussions|pulls)/"
+    }
+  ],
+  "replacementPatterns": [
+    { "pattern": "^/", "replacement": "{{BASEURL}}/" }
+  ],
+  "httpStatusCodes": {
+    "404": "ignore",
+    "429": "warn"
+  },
+  "retryOn429": true,
+  "retryCount": 3,
+  "fallbackSitesAllow404Sites": ["https://github.com/ganeshrvel/openmtp"]
+}

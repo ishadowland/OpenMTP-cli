@@ -1,0 +1,60 @@
+name: Bug report
+description: Something a released binary does is broken. Not useful yet — there are no releases.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Heads up:** this project has not shipped a release. If you found a
+        > problem with `OpenMTP.app` itself, file it upstream at
+        > [ganeshrvel/openmtp](https://github.com/ganeshrvel/openmtp/issues) instead.
+        > If you are testing a local build of `openmtp-cli`, fill this in.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `openmtp --version`, or the commit hash if built from source.
+      placeholder: openmtp 0.1.0 (commit abc1234)
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Minimal commands that trigger the bug. Use fenced ```bash blocks.
+      placeholder: |
+        ```
+        $ openmtp list
+        panic: ...
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: macOS version, OpenMTP.app version, device model & Android version, how you installed `openmtp-cli`.
+      placeholder: |
+        - macOS 14.6
+        - OpenMTP.app 3.3.0
+        - Pixel 8, Android 15
+        - `openmtp-cli` built from main with `go build` (commit abc1234)
+    validations:
+      required: true

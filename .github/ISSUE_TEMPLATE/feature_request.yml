@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest a CLI command that is NOT on the README wishlist. For commands already on the wishlist, use "Scope discussion".
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Heads up:** commands already listed in the [README wishlist](https://github.com/ishadowland/openmtp-cli#planned-scope-not-implemented-yet)
+        > (`list`, `mount`, `pull`, `push`, `watch`, `config`, `eject`, `--json`,
+        > Python library mode) should go through the **Scope discussion** template
+        > instead, so the discussion can pick an implementation approach before
+        > code lands.
+
+  - type: input
+    id: title
+    attributes:
+      label: One-line summary
+      placeholder: Add `verify` subcommand — pre-flight integrity check on a transfer
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: |
+        Why is the existing wishlist not enough? What gap does this fill?
+    validations:
+      required: true
+
+  - type: textarea
+    id: surface
+    attributes:
+      label: Sketch of the CLI surface
+      description: Fenced ```bash block with example invocations and outputs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes / alternatives considered
+    validations:
+      required: false

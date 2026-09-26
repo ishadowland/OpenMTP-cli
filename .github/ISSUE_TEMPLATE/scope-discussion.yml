@@ -1,0 +1,105 @@
+name: Scope discussion
+description: Propose a CLI command, an implementation approach, or a language/ecosystem pick. Use this before sending code.
+labels: ["scope", "needs-design"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Before you fill this in
+
+        - Read the [README](https://github.com/ishadowland/openmtp-cli#readme) — it lists the open scope and the design trade-offs.
+        - Search existing issues to avoid duplicating an in-flight proposal.
+        - Keep the proposal small enough that someone could implement it in one PR.
+
+  - type: input
+    id: title
+    attributes:
+      label: One-line summary
+      description: |
+        Format: `[verb] [thing] — [why]`. Example: `Add \`list\` subcommand — back the README wishlist`.
+      placeholder: Add `list` subcommand — back the README wishlist
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: |
+        What user problem does this solve? Quote or paraphrase the relevant line from the README wishlist if applicable.
+      placeholder: |
+        The README lists `openmtp list` as a planned command. Today, the only
+        way to see connected devices is to open the OpenMTP GUI. A `list`
+        subcommand lets scripts enumerate devices without bringing up the GUI.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-cli
+    attributes:
+      label: Proposed CLI surface
+      description: |
+        Concrete command(s), flags, and example invocations. Use fenced code blocks with ```bash.
+      placeholder: |
+        ```
+        $ openmtp list
+        serial=ABC123  vendor=Google  model=Pixel 8  storage=128GB
+        serial=DEF456  vendor=Samsung  model=Galaxy S23  storage=256GB
+
+        $ openmtp list --json
+        [{"serial":"ABC123","vendor":"Google","model":"Pixel 8","storage_bytes":128000000000}, ...]
+        ```
+    validations:
+      required: true
+
+  - type: dropdown
+    id: approach
+    attributes:
+      label: Implementation approach
+      description: |
+        Pick one of the rows from the README's "Implementation ideas" table, or propose a new one.
+      options:
+        - Wrap the bundled `mtp-cli` from `OpenMTP.app/Contents/Resources/bin/`
+        - Shell out to `adb` for MTP transfers (libusb-based fallback)
+        - Talk to `OpenMTP.app` over its Electron IPC / XPC
+        - Hybrid (e.g. `mtp-cli` first, `adb` fallback when the app is not running)
+        - Other (describe in *Notes* below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: language
+    attributes:
+      label: Language / toolchain
+      description: |
+        If you are picking one, list the rationale (binary size, ecosystem, ability to call the bundled Mach-O `mtp-cli`, etc.) in *Notes*.
+      options:
+        - Go
+        - Rust
+        - Python
+        - Node / TypeScript
+        - Other (describe in *Notes* below)
+        - "Not picking — I just want to discuss the command surface"
+    validations:
+      required: true
+
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Trade-offs / open questions
+      description: |
+        What does this proposal *not* do? What assumptions does it make? Anything that needs an answer from a maintainer?
+      placeholder: |
+        - Assumes `mtp-cli` is shipped in `OpenMTP.app/Contents/Resources/bin/`; if upstream changes the layout, this breaks.
+        - No resume support for `pull`/`push` in v1 — defer to a later issue.
+        - `--json` shape TBD; should it match `adb devices -l`?
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Screenshots, links to upstream issues, prior art, etc.
+    validations:
+      required: false

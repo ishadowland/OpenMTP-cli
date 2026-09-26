@@ -1,0 +1,29 @@
+name: Lint links
+
+# Keep the README honest while there is no code to build.
+# Runs on every push and PR. Warns on broken external links instead of failing,
+# so a transient upstream outage does not block merge.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  markdown-link-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check links in Markdown
+        uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          config-file: .github/lint-config/markdown-link-check.json
+          # Do not fail the build on link issues — leave that to maintainer review.
+          fail-on-error: false

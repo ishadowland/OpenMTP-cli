@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Project README & scope
+    url: https://github.com/ishadowland/openmtp-cli#readme
+    about: Read this first — it lists the open scope and design questions.
+  - name: Discussions (design chat)
+    url: https://github.com/ishadowland/openmtp-cli/discussions
+    about: For open-ended questions before you commit to an issue.
