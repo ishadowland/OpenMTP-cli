@@ -25,5 +25,6 @@ jobs:
         uses: gaurav-nelson/github-action-markdown-link-check@v1
         with:
           config-file: .github/lint-config/markdown-link-check.json
-          # Do not fail the build on link issues — leave that to maintainer review.
-          fail-on-error: false
+        # The action has no fail-on-error input; instead, never break the build
+        # on a transient link rot — let reviewers triage the warning.
+        continue-on-error: true

@@ -32,7 +32,7 @@
 
 <!-- Reviewers will reject PRs that skip these. -->
 
-- [ ] I read [`CONTRIBUTING.md`](../../blob/main/CONTRIBUTING.md)
+- [ ] I read [`CONTRIBUTING.md`](../blob/main/CONTRIBUTING.md)
 - [ ] I opened (or commented substantively on) an issue before writing code
 - [ ] My change is small enough to review in one sitting
 - [ ] `git commit` messages use the imperative mood
