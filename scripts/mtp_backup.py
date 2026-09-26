@@ -177,7 +177,10 @@ def main(argv: list[str] | None = None) -> int:
         "--list-timeout",
         type=float,
         default=10.0,
-        help="Seconds for the initial directory listing (default: 10).",
+        help="Seconds for the initial directory listing (default: 10). When "
+             "the manual DFS is used (the default, see --use-recursive), "
+             "this is the per-directory budget; the full walk is "
+             "depth × timeout seconds worst case.",
     )
     parser.add_argument(
         "--file-timeout",
@@ -195,6 +198,15 @@ def main(argv: list[str] | None = None) -> int:
              "up. Default: 0.",
     )
     parser.add_argument(
+        "--use-recursive",
+        action="store_true",
+        help="Use mtp-cli's native `lsext-r` for the initial listing "
+             "instead of the wrapper's manual DFS via per-directory "
+             "`lsext <path>`. Faster on devices that support it natively, "
+             "but **hangs on OnePlus 12** and similar OPPO-derived devices "
+             "(see issue #2). Default: false (manual DFS, the safe option).",
+    )
+    parser.add_argument(
         "--no-json",
         action="store_true",
         help="Print human-readable text instead of JSON.",
@@ -207,24 +219,19 @@ def main(argv: list[str] | None = None) -> int:
         om.die(str(e), code=1)
 
     # Step 1: list
-    commands = ["lsext-r"] if args.src in ("/", "") else [f"lsext-r {args.src}"]
-    list_result = om.run_mtp(
-        commands,
+    nodes, list_errors = om.walk_tree(
+        args.src,
         mtp_cli_path=mtp_cli_path,
         timeout=args.list_timeout,
         retries_on_hang=max(0, args.retry_on_hang),
+        recursive=args.use_recursive,
     )
-    if list_result.timed_out:
+    if not nodes:
         om.die(
-            f"mtp-cli did not respond within {args.list_timeout}s while listing "
-            f"{args.src!r} after {list_result.attempts} attempt(s) "
-            f"(last_command={list_result.last_command!r}).\n"
-            + om.hang_recovery_hint(list_result),
+            f"no entries returned for {args.src!r}."
+            + (f" Subdirectory errors: {list_errors}" if list_errors else ""),
             code=2,
         )
-    nodes = om.parse_lsext(list_result.stdout)
-    if not nodes:
-        om.die(f"no entries returned for {args.src!r}.", code=2)
 
     nodes = om.attach_paths(nodes)
     planned = plan(
