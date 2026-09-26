@@ -226,7 +226,7 @@ class TestRunMtpRetriesOnHang:
     def test_no_retry_by_default(self, monkeypatch):
         counter = {"n": 0}
         monkeypatch.setattr(om.subprocess, "Popen", self._make_hang_proc(counter))
-        r = om.run_mtp(["lsext-r /DCIM"], timeout=1)
+        r = om.run_mtp(["lsext-r /DCIM"], mtp_cli_path=Path("/fake/mtp-cli"), timeout=1)
         assert r.timed_out is True
         assert r.attempts == 1
         assert counter["n"] == 1
@@ -263,6 +263,7 @@ class TestRunMtpRetriesOnHang:
 
         r = om.run_mtp(
             ["lsext-r /DCIM"],
+            mtp_cli_path=Path("/fake/mtp-cli"),
             timeout=1,
             retries_on_hang=2,
         )
@@ -277,6 +278,7 @@ class TestRunMtpRetriesOnHang:
 
         r = om.run_mtp(
             ["lsext-r /DCIM"],
+            mtp_cli_path=Path("/fake/mtp-cli"),
             timeout=1,
             retries_on_hang=3,
         )
@@ -287,7 +289,10 @@ class TestRunMtpRetriesOnHang:
     def test_last_command_is_first_command(self, monkeypatch):
         counter = {"n": 0}
         monkeypatch.setattr(om.subprocess, "Popen", self._make_hang_proc(counter))
-        r = om.run_mtp(["device-info", "select-storage 65537", "lsext-r /DCIM"])
+        r = om.run_mtp(
+            ["device-info", "select-storage 65537", "lsext-r /DCIM"],
+            mtp_cli_path=Path("/fake/mtp-cli"),
+        )
 
 
 class TestHangRecoveryHint:
