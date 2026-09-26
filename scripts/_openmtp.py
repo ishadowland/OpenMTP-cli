@@ -22,7 +22,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, NoReturn, Optional, Sequence
+from typing import Any, Iterable, NoReturn, Optional, Sequence
 
 
 # -----------------------------------------------------------------------------
@@ -100,6 +100,7 @@ def run_mtp(
     *,
     mtp_cli_path: Optional[Path] = None,
     timeout: float = 5.0,
+    extra_args: Sequence[str] = (),
 ) -> MTPResult:
     """Spawn mtp-cli in batch mode and run a sequence of commands.
 
@@ -108,6 +109,10 @@ def run_mtp(
     process exits (driven by the ``quit`` command) or until ``timeout``
     seconds elapse.
 
+    ``extra_args`` are appended after ``-b`` so callers can pass ``-C`` (no
+    USB claim), ``-e`` (allow event processing), ``-R`` (reset device),
+    ``-v`` (verbose), etc. Use ``run_mtp(extra_args=("-C",))``.
+
     A timeout is normal when no Android device is plugged in or the device is
     not in MTP mode — ``mtp-cli`` will sit waiting on libusb for a device.
     Callers should check ``timed_out`` and report a friendly message instead
@@ -115,10 +120,11 @@ def run_mtp(
     """
     path = mtp_cli_path or find_mtp_cli()
     payload = "\n".join(commands) + "\nquit\n"
+    argv = [str(path), "-b", *extra_args]
 
     try:
         proc = subprocess.Popen(
-            [str(path), "-b"],
+            argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -134,6 +140,112 @@ def run_mtp(
         proc.kill()
         stdout, stderr = proc.communicate()
         return MTPResult(stdout=stdout, stderr=stderr, timed_out=True, exit_code=proc.returncode)
+
+
+# -----------------------------------------------------------------------------
+# Device detection with fallback flag combinations
+# -----------------------------------------------------------------------------
+#
+# Real devices sometimes fail to enumerate under the default invocation. The
+# combinations below cover the cases observed in the wild:
+#
+#   default  — what works in 99% of cases.
+#   -C       — do not exclusively claim the USB interface. Useful when
+#              another process (e.g. a leftover OpenMTP.app Helper) is
+#              holding the interface even after the main app quit.
+#   -e       — allow event processing. Untested upstream hypothesis from
+#              openmtp-cli issue #1: a OnePlus 12 on macOS 13.6 reports
+#              "kIOReturnNoDevice" (0xe00002be) under default invocation
+#              but the GUI copy works. Worth retrying with events enabled.
+#
+# Order matters: ``detect_device`` stops on the first attempt that yields
+# non-empty ``device-info`` or ``storage-list`` output. Don't put expensive
+# / risky flags (e.g. ``-R`` which resets the USB device) in this default
+# chain; gate those behind an explicit user opt-in.
+#
+MTP_DETECT_ATTEMPTS: list[tuple[str, tuple[str, ...]]] = [
+    ("default", ()),
+    ("-C",      ("-C",)),
+    ("-e",      ("-e",)),
+]
+
+
+@dataclass
+class DetectResult:
+    """Outcome of a :func:`detect_device` run.
+
+    Attributes:
+        connected: True if any attempt returned non-empty ``device-info`` or
+            ``storage-list`` output within the timeout.
+        last_result: The raw :class:`MTPResult` from the last attempt that
+            ran. Inspect ``last_result.stderr`` for IOKit / libusb errors.
+        device_info: Parsed from the first successful attempt (or empty).
+        storages: Parsed from the first successful attempt (or empty).
+        attempted: Labels (in order) of every attempt that ran. The last
+            entry corresponds to ``last_result``.
+    """
+
+    connected: bool
+    last_result: MTPResult
+    device_info: dict[str, str]
+    storages: list[dict]
+    attempted: list[str]
+
+
+def detect_device(
+    *,
+    mtp_cli_path: Path,
+    timeout: float = 5.0,
+    commands: Sequence[str] = ("version", "device-info", "storage-list"),
+    attempts: Sequence[tuple[str, tuple[str, ...]]] = MTP_DETECT_ATTEMPTS,
+    runner: Optional[Any] = None,
+) -> DetectResult:
+    """Try multiple mtp-cli flag combinations until one yields a device.
+
+    Stops early on the first success or on the first timeout — timeouts are
+    deterministic (no device on USB), so retrying with different flags does
+    not help.
+
+    ``runner`` defaults to :func:`run_mtp`. Tests inject a fake runner that
+    returns canned ``MTPResult`` values; production callers should leave it
+    alone.
+    """
+    if not attempts:
+        raise ValueError("attempts must not be empty")
+    run = runner if runner is not None else run_mtp
+
+    def _run_once(label: str, flags: tuple[str, ...]) -> tuple[str, MTPResult, dict, list]:
+        result = run(
+            list(commands),
+            mtp_cli_path=mtp_cli_path,
+            timeout=timeout,
+            extra_args=list(flags),
+        )
+        return (
+            label,
+            result,
+            parse_device_info(result.stdout),
+            parse_storage_list(result.stdout),
+        )
+
+    label, last_result, device_info, storages = _run_once(*attempts[0])
+    attempted = [label]
+    connected = (not last_result.timed_out) and (bool(device_info) or bool(storages))
+
+    for label, flags in attempts[1:]:
+        if connected or last_result.timed_out:
+            break
+        attempted.append(label)
+        label, last_result, device_info, storages = _run_once(label, flags)
+        connected = bool(device_info) or bool(storages)
+
+    return DetectResult(
+        connected=connected,
+        last_result=last_result,
+        device_info=device_info,
+        storages=storages,
+        attempted=attempted,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -280,8 +392,46 @@ _STORAGE_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# mtp-cli's `storage-list` (v3.9-2) actually emits:
+#     65537    volume: , description: 内部共享存储空间
+# where ``65537`` is the storage id in **decimal** (not hex), followed by
+# ``volume: <size>, description: <name>`` after the spaces. This regex
+# captures the positional form.
+_STORAGE_LINE_POSITIONAL_RE = re.compile(
+    r"^(?P<id>\d+)\s+volume:[ \t]*,?[ \t]*description:[ \t]*(?P<desc>.+?)\s*$",
+    re.IGNORECASE,
+)
+
 _DEVICE_INFO_KEY_VALUE_RE = re.compile(
     r"^(?P<key>[A-Za-z][A-Za-z _]*?)[ \t]*:[ \t]*(?P<value>.+?)\s*$"
+)
+
+# Lines that look like libmtp / IOKit status output but carry no per-device
+# info — skip them in both parse_device_info and parse_storage_list.
+_NOISE_PREFIXES = (
+    "IOCreatePlugInInterfaceForService",  # IOKit plugin-interface error
+    "selected storage",                   # libmtp "selected storage <id>" status
+)
+
+# mtp-cli's `device-info` output, on the v3.9-2 (android-file-transfer-linux)
+# build bundled with OpenMTP.app, is a FIXED-ORDER list of bare values rather
+# than ``key: value`` lines:
+#
+#     OnePlus                       # manufacturer
+#     PJD110                        # model
+#     1.0                           # device version
+#     E0F91C3176A64C078D2C01B9C94F975D  # serial number
+#     microsoft.com: 1.0; android.com: 1.0;  # extended props (one per line)
+#
+# Older builds (and the help text in references/mtp-cli-commands.md) suggest
+# a colon-separated ``Manufacturer: ...`` format that we ALSO accept. The
+# positional fallback handles the bundled build; the key:value path handles
+# anything else.
+_DEVICE_INFO_POSITIONAL_KEYS = (
+    "manufacturer",
+    "model",
+    "device version",
+    "serial number",
 )
 
 
@@ -389,38 +539,117 @@ def attach_paths(nodes: Iterable[TreeNode]) -> list[TreeNode]:
 
 
 def parse_storage_list(output: str) -> list[dict]:
-    """Parse the output of ``storage-list`` into a list of storage records."""
+    """Parse the output of ``storage-list`` into a list of storage records.
+
+    Supports two output formats:
+      1. ``Storage: <hex-id> <description> [<free> free / <total> total]``
+         (some mtp-cli builds; ``Storage: <hex-id> <description>`` alone
+         is also accepted).
+      2. ``<decimal-id>    volume: <size>, description: <name>``
+         (the v3.9-2 build bundled with OpenMTP.app uses this form).
+    """
     records: list[dict] = []
     for line in output.splitlines():
         line = line.strip()
-        if not line.lower().startswith("storage:"):
+        if not line:
             continue
-        m = _STORAGE_LINE_RE.match(line)
-        if not m:
-            # Keep what we can; flag the parse failure for the caller.
+        if any(line.startswith(p) for p in _NOISE_PREFIXES):
+            continue
+
+        # Format 1: ``Storage:`` prefix.
+        if line.lower().startswith("storage:"):
+            m = _STORAGE_LINE_RE.match(line)
+            if m:
+                rec: dict = {
+                    "id": m.group("id"),
+                    "description": m.group("desc").strip(),
+                }
+                if m.group("free"):
+                    rec["free"] = f"{m.group('free')} {m.group('free_unit')}"
+                    rec["total"] = f"{m.group('total')} {m.group('total_unit')}"
+                records.append(rec)
+                continue
+            # Fallback for `Storage: <id> <desc>` with no free/total.
+            m2 = re.match(
+                r"Storage:[ \t]*(?P<id>0x[0-9A-Fa-f]+|\d+)[ \t]+(?P<desc>.+)$",
+                line,
+                re.IGNORECASE,
+            )
+            if m2:
+                records.append({
+                    "id": m2.group("id"),
+                    "description": m2.group("desc").strip(),
+                })
+                continue
+            # Unrecognised Storage: line — preserve as raw for debugging.
             records.append({"raw": line, "parse_error": True})
             continue
-        rec: dict = {
-            "id": m.group("id"),
-            "description": m.group("desc").strip(),
-        }
-        if m.group("free"):
-            rec["free"] = f"{m.group('free')} {m.group('free_unit')}"
-            rec["total"] = f"{m.group('total')} {m.group('total_unit')}"
-        records.append(rec)
+
+        # Format 2: decimal-id + volume:/description:
+        m3 = _STORAGE_LINE_POSITIONAL_RE.match(line)
+        if m3:
+            records.append({
+                "id": m3.group("id"),
+                "description": m3.group("desc").strip(),
+            })
+            continue
+
+        # Otherwise: unknown / noise; skip silently.
     return records
 
 
 def parse_device_info(output: str) -> dict[str, str]:
-    """Parse the output of ``device-info`` into a flat key/value map."""
+    """Parse the output of ``device-info`` into a flat key/value map.
+
+    Supports two output formats:
+      1. ``key: value`` lines (some mtp-cli builds)
+      2. Bare values in fixed order: manufacturer, model, device version,
+         serial number, then one or more extended-property lines
+         (the v3.9-2 build bundled with OpenMTP.app uses this form).
+
+    Key:value lines take precedence over the positional fallback: if a line
+    matches both, the explicit key wins. Lines that look like libmtp /
+    IOKit noise are skipped.
+    """
     info: dict[str, str] = {}
-    for line in output.splitlines():
-        line = line.strip()
-        if not line or ":" not in line:
+    positional_idx = 0
+    extra_idx = 0
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
+        if any(line.startswith(p) for p in _NOISE_PREFIXES):
+            continue
+        if line.lower().startswith("storage:"):
+            continue
+        # Skip the bare-numeric "65537    volume:..." form — that's
+        # storage-list territory, handled by parse_storage_list.
+        if _STORAGE_LINE_POSITIONAL_RE.match(line):
+            continue
+
         m = _DEVICE_INFO_KEY_VALUE_RE.match(line)
         if m:
             info[m.group("key").strip().lower()] = m.group("value").strip()
+            continue
+
+        # Positional fallback for the bare-value format. Find the first
+        # empty positional slot (an explicit key:value line may have
+        # already filled slot 0, in which case the first bare value goes
+        # into slot 1, etc.). Once all positional slots are full, treat
+        # the line as an extended property.
+        filled = False
+        for k in range(positional_idx, len(_DEVICE_INFO_POSITIONAL_KEYS)):
+            key = _DEVICE_INFO_POSITIONAL_KEYS[k]
+            if key not in info:
+                info[key] = line
+                positional_idx = k + 1
+                filled = True
+                break
+        if not filled and positional_idx >= len(_DEVICE_INFO_POSITIONAL_KEYS):
+            extra_idx += 1
+            info[f"extended property {extra_idx}"] = line
+
     return info
 
 

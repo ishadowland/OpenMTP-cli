@@ -162,6 +162,39 @@ Storage: 0x00020001  SD card       50.00 GB free / 128.00 GB total
         assert out[0]["description"] == "Phone storage"
         assert "free" not in out[0]
 
+    def test_decimal_id_positional_format(self):
+        # Verbatim from issue #1: the v3.9-2 build bundled with OpenMTP.app
+        # emits decimal storage ids with a ``volume:, description:`` payload
+        # instead of the ``Storage: 0x...`` prefix.
+        raw = "65537    volume: , description: 内部共享存储空间\n"
+        out = om.parse_storage_list(raw)
+        assert len(out) == 1
+        assert out[0]["id"] == "65537"
+        assert out[0]["description"] == "内部共享存储空间"
+        assert "free" not in out[0]
+
+    def test_decimal_and_hex_formats_together(self):
+        raw = (
+            "Storage: 0x00010001  Phone storage  100 GB free / 256 GB total\n"
+            "65537    volume: , description: 内部共享存储空间\n"
+        )
+        out = om.parse_storage_list(raw)
+        assert len(out) == 2
+        assert out[0]["id"] == "0x00010001"
+        assert out[1]["id"] == "65537"
+
+    def test_iokit_noise_lines_skipped(self):
+        # Lines that look like libmtp / IOKit status output should be skipped,
+        # not misinterpreted as storage records.
+        raw = (
+            "IOCreatePlugInInterfaceForService(...): error 0xe00002be\n"
+            "selected storage 65537  内部共享存储空间\n"
+            "65537    volume: , description: 内部共享存储空间\n"
+        )
+        out = om.parse_storage_list(raw)
+        assert len(out) == 1
+        assert out[0]["id"] == "65537"
+
 
 class TestParseDeviceInfo:
     def test_basic_fields(self):
@@ -179,3 +212,59 @@ Serial number: ABC123
 
     def test_empty_input(self):
         assert om.parse_device_info("") == {}
+
+    def test_bare_value_positional_format(self):
+        # Verbatim from issue #1: the v3.9-2 build bundled with OpenMTP.app
+        # emits fixed-order bare values instead of ``Manufacturer: ...``.
+        raw = """\
+OnePlus
+PJD110
+1.0
+E0F91C3176A64C078D2C01B9C94F975D
+microsoft.com: 1.0; android.com: 1.0;
+"""
+        info = om.parse_device_info(raw)
+        assert info["manufacturer"] == "OnePlus"
+        assert info["model"] == "PJD110"
+        assert info["device version"] == "1.0"
+        assert info["serial number"] == "E0F91C3176A64C078D2C01B9C94F975D"
+        assert "extended property 1" in info
+        assert info["extended property 1"] == "microsoft.com: 1.0; android.com: 1.0;"
+
+    def test_iokit_and_storage_noise_skipped(self):
+        # Real mtp-cli output mixes libmtp status noise with device data. The
+        # parser must skip IOKit / "selected storage" / "Storage:" / volume
+        # lines and still extract the device fields from the bare values.
+        raw = """\
+IOCreatePlugInInterfaceForService(...): error 0xe00002be
+IOCreatePlugInInterfaceForService(...): error 0xe00002be
+selected storage 65537  内部共享存储空间
+OnePlus
+PJD110
+1.0
+E0F91C3176A64C078D2C01B9C94F975D
+microsoft.com: 1.0; android.com: 1.0;
+65537    volume: , description: 内部共享存储空间
+"""
+        info = om.parse_device_info(raw)
+        assert info["manufacturer"] == "OnePlus"
+        assert info["model"] == "PJD110"
+        assert info["device version"] == "1.0"
+        assert info["serial number"] == "E0F91C3176A64C078D2C01B9C94F975D"
+        # No "storage" key leaked in from the "Storage:" or volume lines.
+        assert "storage" not in info
+
+    def test_explicit_key_wins_over_positional(self):
+        # If a build emits both ``Manufacturer: X`` AND a bare value line at
+        # the same position, the explicit key takes precedence.
+        raw = """\
+Manufacturer: Google
+Pixel 8
+1.0
+ABC123
+"""
+        info = om.parse_device_info(raw)
+        assert info["manufacturer"] == "Google"
+        # The bare "Pixel 8" lands in the model slot, which the explicit key
+        # for manufacturer did NOT pre-fill, so positional still works there.
+        assert info["model"] == "Pixel 8"

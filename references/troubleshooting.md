@@ -66,7 +66,57 @@ it doesn't:
 - Kill them: `pkill -9 mtp-cli`.
 - File an issue — the libusb teardown on this USB controller is buggy.
 
-## 5. `Error: mtp-cli exit N` during `mtp-backup`
+## 5. IOKit `0xe00002be` (`kIOReturnNoDevice`) in stderr but the device IS visible to OpenMTP.app
+
+Symptom (verbatim from issue #1):
+
+```sh
+$ mtp-list
+{
+  "connected": false,
+  "mtp_cli_stderr": "IOCreatePlugInInterfaceForService(...): error 0xe00002be\nIOCreatePlugInInterfaceForService(...): error 0xe00002be\nno mtp device found",
+  ...
+}
+```
+
+…and yet the GUI of OpenMTP.app just successfully copied a file from the
+same phone on the same USB port a moment ago.
+
+The `0xe00002be` is **`kIOReturnNoDevice`** from IOKit's USB device user
+client. It is **not always fatal**: the bundled `mtp-cli` (v3.9-2,
+android-file-transfer-linux fork) often logs the error to stderr but still
+goes on to enumerate the device on stdout. Until the parser was fixed, the
+wrapper saw an empty `device-info` parse and reported `connected: false`
+even though the device was actually visible in `stdout`. The current
+parser accepts both output formats, so the reported `connected: true` for
+the same setup.
+
+What to do if you still see `connected: false` despite the GUI working:
+
+1. **Read `mtp_cli_stderr` first.** If the error code is `0xe00002be`, the
+   USB interface claim failed. Common causes:
+   - A leftover OpenMTP Helper process from a previous GUI session still
+     owns the interface even though the main app quit. Try
+     `pkill -9 -f "OpenMTP Helper"` and re-run.
+   - macOS hasn't refreshed its IOKit device cache after a USB role
+     switch (phone went from "charging" → "MTP"). Wait ~10 s, replug the
+     cable, or:
+     ```sh
+     sudo killall -HUP usbd
+     ```
+     This forces `usbd` to re-enumerate. Requires sudo; briefly
+     disconnects all USB devices.
+2. **Try the fallback chain explicitly.** `mtp-list` already retries with
+   `-C` and `-e` automatically. To force the original invocation (e.g.
+   when debugging flag interactions), pass `--no-fallback`. The
+   `attempted` field in the JSON output records which combinations ran.
+3. **If `connected: true` was returned after the fix but the device
+   fields look empty**, this is the parser-fix in action: the JSON now
+   contains `manufacturer` / `model` / `device version` / `serial number`
+   populated from the positional format. If those keys are still
+   missing, file an issue with the `mtp-cli` output verbatim.
+
+## 6. `Error: mtp-cli exit N` during `mtp-backup`
 
 The file copy step failed. Look at the `errors` array in the JSON output:
 each entry has `src`, `dst`, `error`, and a tail of `stderr` for diagnosis.
@@ -81,7 +131,7 @@ Common cases:
   otherwise leave it.
 - Permission error on the local destination. Check `--dst` is writable.
 
-## 6. Test on a phone you trust
+## 7. Test on a phone you trust
 
 MTP transfers are write/read against the user's only copy of their photos.
 Before running `--no-dry-run`:
@@ -95,7 +145,7 @@ There is no "trash" on Android — `rm` on the device is recursive. None of
 the scripts in this repo issue `rm`, but if you script around them with
 the same `run_mtp`, **do not pipe `rm`** unless you really mean it.
 
-## 7. Reporting bugs
+## 8. Reporting bugs
 
 Open an issue at <https://github.com/ishadowland/openmtp-cli/issues>. Include:
 

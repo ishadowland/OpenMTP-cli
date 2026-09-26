@@ -4,6 +4,12 @@
 Exits 0 if a device responds to ``device-info`` within the timeout, 1 otherwise.
 The output JSON is printed to stdout regardless of exit code, so callers can
 inspect ``connected`` without parsing stderr.
+
+When no device is found, this script tries a small fallback chain of mtp-cli
+flag combinations (default → ``-C`` → ``-e``) before declaring failure. The
+last attempt's stderr (which is where mtp-cli prints IOKit errors like
+``0xe00002be``) is included in the JSON output under ``mtp_cli_stderr`` so the
+agent / user doesn't have to dig for it.
 """
 
 from __future__ import annotations
@@ -14,6 +20,35 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _openmtp as om  # noqa: E402
+
+
+# Truncate mtp-cli stderr at this many characters when echoing it into the
+# JSON output. A noisy IOKit traceback can easily exceed 10 KB; keep the
+# diagnostic short enough for the agent to ingest without overflow.
+STDERR_TAIL_CHARS = 1000
+
+
+def _human_print_failure(detect: om.DetectResult, mtp_cli_path: Path, timeout: float) -> None:
+    last = detect.last_result
+    print(f"Not connected ({len(detect.attempted)} attempt(s): {', '.join(detect.attempted)})", file=sys.stderr)
+    if last.timed_out:
+        print(
+            f"Error: mtp-cli did not respond within {timeout}s. "
+            "Likely causes: no Android device plugged in, USB mode not set "
+            "to 'File transfer / MTP', or device is locked.",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"Error: mtp-cli returned no device-info or storage-list for any "
+        f"attempted flag combination. If mtp_cli_stderr shows IOKit errors "
+        f"like 0xe00002be (kIOReturnNoDevice), USB enumeration is failing — "
+        f"see references/troubleshooting.md §IOKit.",
+        file=sys.stderr,
+    )
+    if last.stderr.strip():
+        print("--- mtp-cli stderr (last {n} chars) ---".format(n=STDERR_TAIL_CHARS), file=sys.stderr)
+        print(last.stderr.strip()[-STDERR_TAIL_CHARS:], file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,6 +69,12 @@ def main(argv: list[str] | None = None) -> int:
              "Default: 5.",
     )
     parser.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help="Skip the flag-combination fallback chain. Use the very first "
+             "attempt only. Helpful when debugging mtp-cli flag interactions.",
+    )
+    parser.add_argument(
         "--no-json",
         action="store_true",
         help="Print human-readable text instead of JSON.",
@@ -49,59 +90,77 @@ def main(argv: list[str] | None = None) -> int:
             om.emit_json({"connected": False, "mtp_cli_path": None, "error": str(e)})
         return 1
 
-    result = om.run_mtp(
-        ["version", "device-info", "storage-list"],
+    attempts = om.MTP_DETECT_ATTEMPTS if not args.no_fallback else om.MTP_DETECT_ATTEMPTS[:1]
+
+    detect = om.detect_device(
         mtp_cli_path=mtp_cli_path,
         timeout=args.timeout,
+        attempts=attempts,
     )
 
-    if result.timed_out:
-        # Most common case: no device plugged in, or device not in MTP mode.
+    if detect.connected:
+        winning_attempt = detect.attempted[-1]
         payload = {
-            "connected": False,
+            "connected": True,
             "mtp_cli_path": str(mtp_cli_path),
-            "error": (
-                f"mtp-cli did not respond within {args.timeout}s. "
-                "Likely causes: no Android device plugged in, USB mode not set "
-                "to 'File transfer / MTP', or device is locked."
-            ),
+            "device": detect.device_info or None,
+            "storages": detect.storages,
+            "attempted": [winning_attempt],
         }
         if args.no_json:
-            print(f"Not connected: {payload['error']}", file=sys.stderr)
-        else:
-            om.emit_json(payload)
-        return 1
+            print(f"Connected: True (via {winning_attempt})")
+            print(f"mtp-cli:   {mtp_cli_path}")
+            if detect.device_info:
+                for key, value in detect.device_info.items():
+                    print(f"  {key}: {value}")
+            for s in detect.storages:
+                line = f"  storage {s.get('id', '?')}: {s.get('description', '?')}"
+                if s.get("free") and s.get("total"):
+                    line += f" ({s['free']} free / {s['total']})"
+                print(line)
+            return 0
+        om.emit_json(payload)
+        return 0
 
-    device_info = om.parse_device_info(result.stdout)
-    storages = om.parse_storage_list(result.stdout)
-
-    # ``device-info`` returning non-empty key/value pairs is the strongest signal
-    # that a device is connected. Some libmtp builds return ``{}`` for the
-    # metadata even when a device is present, so fall back to the storages list.
-    connected = bool(device_info) or bool(storages)
-
+    # Not connected — surface every signal we have.
+    last = detect.last_result
     payload = {
-        "connected": connected,
+        "connected": False,
         "mtp_cli_path": str(mtp_cli_path),
-        "device": device_info or None,
-        "storages": storages,
+        "device": None,
+        "storages": [],
+        "attempted": detect.attempted,
     }
 
+    if last.timed_out:
+        payload["error"] = (
+            f"mtp-cli did not respond within {args.timeout}s. "
+            "Likely causes: no Android device plugged in, USB mode not set "
+            "to 'File transfer / MTP', or device is locked."
+        )
+    else:
+        payload["error"] = (
+            f"mtp-cli returned no device-info or storage-list for any of "
+            f"the {len(detect.attempted)} attempted flag combination(s): "
+            f"{detect.attempted}. "
+            "If mtp_cli_stderr shows IOKit errors (e.g. 0xe00002be = "
+            "kIOReturnNoDevice), USB enumeration is failing — see "
+            "references/troubleshooting.md §IOKit."
+        )
+
+    # Surface stderr — this is where mtp-cli writes the IOKit errors that
+    # explain *why* the device wasn't detected. Without this, the agent has
+    # to re-run mtp-cli manually to see them.
+    stderr = last.stderr.strip()
+    if stderr:
+        payload["mtp_cli_stderr"] = stderr[-STDERR_TAIL_CHARS:]
+
     if args.no_json:
-        print(f"Connected: {connected}")
-        print(f"mtp-cli:   {mtp_cli_path}")
-        if device_info:
-            for key, value in device_info.items():
-                print(f"  {key}: {value}")
-        for s in storages:
-            line = f"  storage {s.get('id', '?')}: {s.get('description', '?')}"
-            if s.get("free") and s.get("total"):
-                line += f" ({s['free']} free / {s['total']})"
-            print(line)
-        return 0 if connected else 1
+        _human_print_failure(detect, mtp_cli_path, args.timeout)
+        return 1
 
     om.emit_json(payload)
-    return 0 if connected else 1
+    return 1
 
 
 if __name__ == "__main__":
