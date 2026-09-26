@@ -102,7 +102,55 @@ and retries up to N times before giving up. Useful for transient hangs.
 The JSON output (when `connected: false`) includes `mtp_cli_attempts`,
 `last_command`, and `recovery_hint` to point at the recovery steps above.
 
-## 5. IOKit `0xe00002be` (`kIOReturnNoDevice`) in stderr but the device IS visible to OpenMTP.app
+## 5. Phone screen turned off mid-transfer — USB MTP session dies entirely
+
+**This is the most common failure mode on ColorOS / OPPO-derived devices**
+(OnePlus 12 confirmed). When the phone's screen auto-locks, Android
+suspends the USB MTP session. Every mtp-cli command then hangs — including
+`device-info` — until the phone is unlocked again. `ioreg` may even stop
+listing the device entirely.
+
+Symptoms:
+
+- `mtp-list` was returning `connected: true`, then suddenly every command
+  times out
+- The phone screen is off / locked
+- `system_profiler SPUSBDataType` may show the device (as a charging
+  device) but MTP operations all hang
+
+**Prevention, in order of preference:**
+
+1. **Developer option "Stay awake while charging"** (recommended):
+   Settings → About device → Version → tap "Build number" 7× to enable
+   developer mode, then Settings → System settings → Developer options →
+   enable **"充电时屏幕不休眠"** ("Stay awake while charging" / "Don't
+   lock the screen while charging"). The screen stays on whenever USB is
+   plugged in — exactly our scenario. Cost: slightly higher battery drain
+   during the transfer; the setting only applies while charging.
+
+2. **Lengthen the auto-lock timeout**: Settings → Display & brightness →
+   Auto screen off → 30 minutes. Simple but affects daily use.
+
+3. **adb route** (needs USB debugging enabled on the phone):
+   ```sh
+   brew install android-platform-tools   # once
+   adb shell svc power stayon usb        # keep screen on while on USB
+   ```
+   The advantage is that this can be issued from the Mac before every
+   backup, no manual phone-side toggling. Prerequisite: Developer options
+   → USB debugging ON, and the phone must have granted the RSA
+   fingerprint dialog at least once. Note: on a locked phone the
+   authorization dialog cannot appear — do this while unlocked.
+
+4. **Keep the screen on during the transfer window**: unlock the phone
+   immediately before starting, and open any app (even the home screen
+   with screen timeout set long enough) so ColorOS does not lock mid-run.
+
+If the session has already died from a screen-off: unlock the phone,
+toggle USB mode or replug the cable, and if that fails
+`sudo killall -HUP usbd` (see §4's recovery runbook).
+
+## 6. IOKit `0xe00002be` (`kIOReturnNoDevice`) in stderr but the device IS visible to OpenMTP.app
 
 Symptom (verbatim from issue #1):
 
@@ -152,7 +200,7 @@ What to do if you still see `connected: false` despite the GUI working:
    populated from the positional format. If those keys are still
    missing, file an issue with the `mtp-cli` output verbatim.
 
-## 6. `Error: mtp-cli exit N` during `mtp-backup`
+## 7. `Error: mtp-cli exit N` during `mtp-backup`
 
 The file copy step failed. Look at the `errors` array in the JSON output:
 each entry has `src`, `dst`, `error`, and a tail of `stderr` for diagnosis.
@@ -167,7 +215,7 @@ Common cases:
   otherwise leave it.
 - Permission error on the local destination. Check `--dst` is writable.
 
-## 7. Test on a phone you trust
+## 8. Test on a phone you trust
 
 MTP transfers are write/read against the user's only copy of their photos.
 Before running `--no-dry-run`:
@@ -181,7 +229,7 @@ There is no "trash" on Android — `rm` on the device is recursive. None of
 the scripts in this repo issue `rm`, but if you script around them with
 the same `run_mtp`, **do not pipe `rm`** unless you really mean it.
 
-## 8. Reporting bugs
+## 9. Reporting bugs
 
 Open an issue at <https://github.com/ishadowland/openmtp-cli/issues>. Include:
 
