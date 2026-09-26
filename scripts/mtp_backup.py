@@ -233,7 +233,11 @@ def main(argv: list[str] | None = None) -> int:
             code=2,
         )
 
-    nodes = om.attach_paths(nodes)
+    # walk_tree already populated node.path (device-root-relative, e.g.
+    # "/DCIM/Camera/IMG.jpg"). Do NOT call attach_paths here — in session
+    # mode every node carries the storage id as parent_id, so attach_paths
+    # would treat each node as an orphan root and clobber the correct path
+    # with a bare filename.
     planned = plan(
         nodes,
         include=args.include,
@@ -244,12 +248,15 @@ def main(argv: list[str] | None = None) -> int:
     dst_root = Path(args.dst).expanduser().resolve()
     mkdir_errors = make_local_dirs(planned, args.src, dst_root)
 
-    # Collect file ops + per-file copy records.
+    # Collect file ops + per-file copy records. ``_rel_from_root`` strips the
+    # --src prefix from the node's device path; for a file node the remainder
+    # is the destination filename (possibly nested if --src pointed higher up
+    # the tree), so no extra ``/ n.name`` — that would duplicate the name.
     file_nodes = [n for n in planned if not n.is_dir]
     file_plan = [
         {
             "src": ("/" + n.path) if not n.path.startswith("/") else n.path,
-            "dst": str(dst_root / _rel_from_root(n.path, args.src) / n.name),
+            "dst": str(dst_root / _rel_from_root(n.path, args.src)),
             "size": n.size,
             "category": n.category,
             "mime": n.mime,

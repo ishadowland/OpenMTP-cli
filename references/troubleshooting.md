@@ -66,6 +66,23 @@ it doesn't:
 - Kill them: `pkill -9 mtp-cli`.
 - File an issue — the libusb teardown on this USB controller is buggy.
 
+### Software USB reset via adb (no sudo, no replug needed)
+
+If USB debugging is authorized on the phone, toggling the USB function
+profile forces the phone side to tear down and rebuild the MTP session —
+this replaces both the cable replug AND `sudo killall -HUP usbd`:
+
+```sh
+adb shell svc usb setFunctions ptp    # switch to PTP
+sleep 4
+adb shell svc usb setFunctions mtp    # switch back to MTP
+sleep 6
+mtp-list                              # should now report connected: true
+```
+
+Tested working on OnePlus 12 / ColorOS after MTP sessions wedged from
+killed mtp-cli processes. Install adb with `brew install android-platform-tools`.
+
 ### Recovery runbook (when hang sticks across invocations)
 
 Once mtp-cli has hung, the USB stack on macOS can be left in a half-stalled

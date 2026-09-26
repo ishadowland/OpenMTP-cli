@@ -139,18 +139,19 @@ class TestWalkTreeNonRecursive:
 
 
 class TestWalkTreeRecursiveFlag:
-    def test_recursive_true_calls_lsext_r(self):
+    def test_recursive_true_calls_lsext_r(self, monkeypatch):
         body = """
 120        65537      3801     578688 2026-06-06 10:18:23  IMG_001.jpg
 """.strip()
         captured = []
 
-        def runner(commands, *, mtp_cli_path, timeout, extra_args=(), retries_on_hang=0):
+        def fake_run_mtp(commands, **kwargs):
             captured.append(" ".join(commands))
             return _lsext_mtp_result(body)
 
+        monkeypatch.setattr(om, "run_mtp", fake_run_mtp)
         nodes, errors = om.walk_tree(
-            "/DCIM", mtp_cli_path=Path("/fake"), timeout=5, run_fn=runner,
+            "/DCIM", mtp_cli_path=Path("/fake"), timeout=5,
             recursive=True,
         )
         # Should have called lsext-r /DCIM exactly once.
@@ -158,7 +159,7 @@ class TestWalkTreeRecursiveFlag:
         assert errors == []
         assert any(n.name == "IMG_001.jpg" for n in nodes)
 
-    def test_recursive_true_with_timeout_returns_partial(self):
+    def test_recursive_true_with_timeout_returns_partial(self, monkeypatch):
         """If lsext-r hangs, walk_tree returns whatever partial stdout
         was buffered + an error message — better than nothing."""
 
@@ -174,11 +175,10 @@ class TestWalkTreeRecursiveFlag:
             last_command="lsext-r /DCIM",
         )
 
-        def runner(commands, *, mtp_cli_path, timeout, extra_args=(), retries_on_hang=0):
-            return result
+        monkeypatch.setattr(om, "run_mtp", lambda commands, **kw: result)
 
         nodes, errors = om.walk_tree(
-            "/DCIM", mtp_cli_path=Path("/fake"), timeout=5, run_fn=runner,
+            "/DCIM", mtp_cli_path=Path("/fake"), timeout=5,
             recursive=True,
         )
         assert any("timed out" in e for e in errors)

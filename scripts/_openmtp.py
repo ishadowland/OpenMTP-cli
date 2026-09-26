@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import selectors
 import subprocess
 import sys
 import time
@@ -865,6 +866,123 @@ def filter_nodes(
 
 
 # -----------------------------------------------------------------------------
+# Persistent mtp-cli session
+# -----------------------------------------------------------------------------
+#
+# Two failure modes make "one process per command" unusable on OnePlus 12:
+#
+#   1. Every mtp-cli start claims the USB interface and every exit releases
+#      it. After a handful of claim/release cycles the phone's MTP daemon
+#      wedges and even `device-info` hangs (see issue #2).
+#   2. Large directory listings (2000+ entries) blow past the stdout pipe
+#      buffer before a short communicate()-style reader gets going.
+#
+# MTPSession solves both: ONE mtp-cli process lives for the whole walk,
+# commands are fed one at a time over stdin, and output is streamed with a
+# "quiet gap" heuristic to detect command completion (mtp-cli batch mode
+# emits no completion marker between commands).
+
+
+class MTPSession:
+    """A single long-lived mtp-cli batch-mode process.
+
+    Usage::
+
+        with MTPSession(mtp_cli_path) as sess:
+            lines = sess.run_command("lsext /DCIM", timeout=20)
+            more = sess.run_command("lsext /DCIM/Camera", timeout=60)
+        # close() kills the process; mtp-cli's `quit` does not reliably exit.
+    """
+
+    def __init__(
+        self,
+        mtp_cli_path: Path,
+        *,
+        extra_args: Sequence[str] = (),
+        quiet_gap: float = 1.0,
+        connect_timeout: float = 15.0,
+    ):
+        self.path = mtp_cli_path
+        self.quiet_gap = quiet_gap
+        self.connect_timeout = connect_timeout
+        self.proc = subprocess.Popen(
+            [str(mtp_cli_path), "-b", *extra_args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        self._sel = selectors.DefaultSelector()
+        self._sel.register(self.proc.stdout, selectors.EVENT_READ)
+        # Drain the session banner ("selected storage ..."), waiting for the
+        # first quiet gap — same heuristic as run_command.
+        self._banner_lines = self._read_until_quiet(connect_timeout)
+
+    def __enter__(self) -> "MTPSession":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def _read_until_quiet(self, timeout: float) -> list[str]:
+        """Stream stdout lines until no new data arrives for ``quiet_gap``
+        seconds or ``timeout`` elapses."""
+        lines: list[str] = []
+        last_data: Optional[float] = None
+        deadline = time.monotonic() + timeout
+        while True:
+            events = self._sel.select(0.1)
+            now = time.monotonic()
+            if events:
+                for key, _ in events:
+                    line = key.fileobj.readline()
+                    if line:
+                        lines.append(line.rstrip("\n"))
+                        last_data = now
+                if now > deadline:
+                    break
+            else:
+                if last_data and (now - last_data) > self.quiet_gap:
+                    break
+                if not last_data and now > deadline:
+                    break
+        return lines
+
+    def run_command(self, command: str, *, timeout: float = 20.0) -> list[str]:
+        """Send one command, return its stdout lines.
+
+        Raises ``TimeoutError`` if the command produced no output at all
+        within ``timeout`` (device gone / MTP daemon wedged). A command that
+        produced *some* output before going quiet returns what it got.
+        """
+        if self.proc.poll() is not None:
+            raise RuntimeError(f"mtp-cli session exited early (code {self.proc.returncode})")
+        self.proc.stdin.write(command + "\n")
+        self.proc.stdin.flush()
+        lines = self._read_until_quiet(timeout)
+        if not lines and self.proc.poll() is not None:
+            raise RuntimeError(f"mtp-cli died while running {command!r}")
+        return lines
+
+    def close(self) -> None:
+        try:
+            if self.proc.poll() is None:
+                try:
+                    self.proc.stdin.write("quit\n")
+                    self.proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=2)
+        finally:
+            self._sel.close()
+
+
+# -----------------------------------------------------------------------------
 # Tree walk (non-recursive workaround)
 # -----------------------------------------------------------------------------
 #
@@ -905,33 +1023,37 @@ def walk_tree(
     exclude: Sequence[str] = (),
     recursive: bool = False,
     run_fn: Optional[Any] = None,
+    session_fn: Optional[Any] = None,
 ) -> tuple[list[TreeNode], list[str]]:
-    """Walk a directory tree via per-directory ``lsext`` invocations.
+    """Walk a directory tree.
 
-    Returns ``(nodes, errors)`` where ``nodes`` is a pre-order list of
-    :class:`TreeNode` entries (with ``path`` populated) and ``errors`` is a
-    list of human-readable strings for subdirectories that timed out or
-    errored during the walk — the caller decides whether to surface them.
+    Three modes, in order of preference:
 
-    ``recursive=True`` calls ``lsext-r <path>`` ONCE and returns its
-    result. Use this only on devices where the recursive call is known to
-    work (anything that isn't OnePlus-derived). On OnePlus the recursive
-    call hangs, the wrapper's timeout will eventually fire, and the
-    partial stdout is preserved in the result so the user sees what was
-    collected before the hang.
+    1. **Persistent session DFS** (default): one :class:`MTPSession` process
+       for the entire walk, one non-recursive ``lsext <path>`` command per
+       directory. This avoids both OnePlus failure modes (USB claim/release
+       cycles wedging the MTP daemon, and pipe-buffer deadlock on large
+       listings). Override in tests via ``session_fn``.
+    2. ``recursive=True``: single ``lsext-r <path>`` call (fast on devices
+       where native recursion works; hangs on OnePlus). Partial stdout is
+       salvaged on timeout.
+    3. ``run_fn`` provided (tests): per-directory separate processes via the
+       injected runner. Production code should not use this mode.
+
+    Returns ``(nodes, errors)``: a pre-order list of :class:`TreeNode` with
+    ``path`` populated, plus human-readable warnings for subdirectories
+    that errored during the walk.
     """
-    run = run_fn if run_fn is not None else run_mtp
     errors: list[str] = []
 
-    # Single recursive call (fast path on non-OnePlus devices).
+    # Mode 2: single recursive call.
     if recursive:
         cmd = ["lsext-r"] if path in ("", "/") else [f"lsext-r {path}"]
-        result = run(cmd, mtp_cli_path=mtp_cli_path, timeout=timeout, retries_on_hang=retries_on_hang)
+        result = run_mtp(
+            cmd, mtp_cli_path=mtp_cli_path, timeout=timeout,
+            retries_on_hang=retries_on_hang,
+        )
         if result.timed_out:
-            # Try to salvage whatever stdout was buffered before the hang.
-            # mtp-cli buffers stdout and only writes when it flushes, so
-            # partial output here is usually only a few lines — but it's
-            # better than nothing.
             partial = parse_lsext(result.stdout)
             if partial:
                 attached = attach_paths(partial)
@@ -953,43 +1075,66 @@ def walk_tree(
             errors,
         )
 
-    # Manual DFS via non-recursive lsext <path> per directory. The output
-    # of `lsext <path>` is the children of <path>; mtp-cli does NOT echo
-    # the directory itself. We use that contract to avoid re-listing the
-    # root node at every level.
     all_nodes: list[TreeNode] = []
 
+    def _list_children(current_path: str, per_dir_timeout: float) -> Optional[list[TreeNode]]:
+        """List one directory. Returns parsed children, or None on error
+        (the error is appended to ``errors``)."""
+        cmd = "lsext" if current_path in ("", "/") else f"lsext {current_path}"
+        label = f"lsext {current_path}" if current_path not in ("", "/") else "lsext /"
+        try:
+            lines = session.run_command(cmd, timeout=per_dir_timeout)
+        except TimeoutError:
+            errors.append(f"{label} produced no output within {per_dir_timeout}s")
+            return None
+        except (RuntimeError, OSError) as e:
+            errors.append(f"{label} failed: {e}")
+            return None
+        children = parse_lsext("\n".join(lines))
+        # Drop any echoed root marker defensively.
+        return [n for n in children if n.parent_id != 0xFFFFFFFF]
+
     def _walk(current_path: str, current_depth: int) -> None:
-        cmd = ["lsext"] if current_path in ("", "/") else [f"lsext {current_path}"]
-        result = run(cmd, mtp_cli_path=mtp_cli_path, timeout=timeout, retries_on_hang=retries_on_hang)
-        if result.timed_out:
-            errors.append(f"lsext {current_path} timed out after {timeout}s")
+        children = _list_children(current_path, timeout)
+        if children is None:
             return
-        children = parse_lsext(result.stdout)
-        # Skip the directory node itself if mtp-cli echoed it. The bundled
-        # build does NOT echo ``<path>`` itself for `lsext <path>`, only
-        # for `lsext` (no path). Be defensive: drop any returned node with
-        # parent_id == 0xFFFFFFFF (root marker).
-        children = [n for n in children if n.parent_id != 0xFFFFFFFF]
-        # Set path on each child.
         for n in children:
-            if current_path in ("", "/"):
-                n.path = n.name
-            else:
-                n.path = f"{current_path}/{n.name}"
+            n.path = n.name if current_path in ("", "/") else f"{current_path}/{n.name}"
         all_nodes.extend(children)
-        # Recurse into subdirectories only if max_depth allows.
-        # ``max_depth=N`` means: include items at depths 1..N. We are at
-        # ``current_depth`` (root listing = depth 0; DCIM listing = depth 1).
-        # To include DCIM's children, recurse from depth 1 to depth 2.
-        # Recursion condition: max_depth > current_depth + 1, i.e. the
-        # children at depth current_depth+1 fit within max_depth.
         if max_depth is None or max_depth > current_depth + 1:
             for n in children:
                 if n.is_dir:
                     _walk(n.path, current_depth + 1)
 
-    _walk(path, 0)
+    # Mode 3 (tests): per-directory separate processes via injected runner.
+    if run_fn is not None:
+        run = run_fn
+
+        def _walk_runfn(current_path: str, current_depth: int) -> None:
+            cmd = ["lsext"] if current_path in ("", "/") else [f"lsext {current_path}"]
+            result = run(cmd, mtp_cli_path=mtp_cli_path, timeout=timeout,
+                         retries_on_hang=retries_on_hang)
+            if result.timed_out:
+                errors.append(f"lsext {current_path} timed out after {timeout}s")
+                return
+            children = parse_lsext(result.stdout)
+            children = [n for n in children if n.parent_id != 0xFFFFFFFF]
+            for n in children:
+                n.path = n.name if current_path in ("", "/") else f"{current_path}/{n.name}"
+            all_nodes.extend(children)
+            if max_depth is None or max_depth > current_depth + 1:
+                for n in children:
+                    if n.is_dir:
+                        _walk_runfn(n.path, current_depth + 1)
+
+        _walk_runfn(path, 0)
+        return _apply_filters(all_nodes, max_depth=None, format_filter=format_filter,
+                              include=include, exclude=exclude), errors
+
+    # Mode 1 (default): persistent session DFS.
+    session_ctx = session_fn if session_fn is not None else MTPSession
+    with session_ctx(mtp_cli_path) as session:
+        _walk(path, 0)
 
     return _apply_filters(all_nodes, max_depth=None, format_filter=format_filter,
                           include=include, exclude=exclude), errors
