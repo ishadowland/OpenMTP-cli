@@ -186,6 +186,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Seconds per file transfer (default: 60). Large videos need more.",
     )
     parser.add_argument(
+        "--retry-on-hang",
+        type=int,
+        default=0,
+        metavar="N",
+        help="If mtp-cli hangs on either the listing or a per-file "
+             "transfer, kill it, wait, and retry up to N times before giving "
+             "up. Default: 0.",
+    )
+    parser.add_argument(
         "--no-json",
         action="store_true",
         help="Print human-readable text instead of JSON.",
@@ -199,11 +208,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # Step 1: list
     commands = ["lsext-r"] if args.src in ("/", "") else [f"lsext-r {args.src}"]
-    list_result = om.run_mtp(commands, mtp_cli_path=mtp_cli_path, timeout=args.list_timeout)
+    list_result = om.run_mtp(
+        commands,
+        mtp_cli_path=mtp_cli_path,
+        timeout=args.list_timeout,
+        retries_on_hang=max(0, args.retry_on_hang),
+    )
     if list_result.timed_out:
         om.die(
-            f"mtp-cli did not respond within {args.list_timeout}s while listing {args.src!r}. "
-            "Check the device is plugged in, unlocked, and in MTP mode.",
+            f"mtp-cli did not respond within {args.list_timeout}s while listing "
+            f"{args.src!r} after {list_result.attempts} attempt(s) "
+            f"(last_command={list_result.last_command!r}).\n"
+            + om.hang_recovery_hint(list_result),
             code=2,
         )
     nodes = om.parse_lsext(list_result.stdout)
@@ -247,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
             "include": args.include,
             "exclude": args.exclude,
             "format_filter": args.format_filter,
+            "retry_on_hang": args.retry_on_hang,
             "planned": file_plan,
             "copied": [],
             "skipped": [],
@@ -274,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
             "include": args.include,
             "exclude": args.exclude,
             "format_filter": args.format_filter,
+            "retry_on_hang": args.retry_on_hang,
             "planned": file_plan,
             "copied": copied,
             "skipped": skipped,

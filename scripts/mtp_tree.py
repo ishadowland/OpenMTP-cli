@@ -110,6 +110,14 @@ def main(argv: list[str] | None = None) -> int:
              "listings on large devices need more headroom than --list.",
     )
     parser.add_argument(
+        "--retry-on-hang",
+        type=int,
+        default=0,
+        metavar="N",
+        help="If mtp-cli hangs (no response within --timeout), kill it, wait, "
+             "and retry up to N times before giving up. Default: 0.",
+    )
+    parser.add_argument(
         "--no-json",
         action="store_true",
         help="Print human-readable text instead of JSON.",
@@ -125,21 +133,33 @@ def main(argv: list[str] | None = None) -> int:
     # needed; we pass the path directly. If --path is ``"/"`` we omit it to
     # list the device root.
     commands = ["lsext-r"] if args.path in ("/", "") else [f"lsext-r {args.path}"]
-    result = om.run_mtp(commands, mtp_cli_path=mtp_cli_path, timeout=args.timeout)
+    result = om.run_mtp(
+        commands,
+        mtp_cli_path=mtp_cli_path,
+        timeout=args.timeout,
+        retries_on_hang=max(0, args.retry_on_hang),
+    )
 
     if result.timed_out:
         om.die(
-            f"mtp-cli did not respond within {args.timeout}s. "
-            "Likely causes: no Android device plugged in, USB mode not set "
-            "to 'File transfer / MTP', or device is locked.",
+            f"mtp-cli did not respond within {args.timeout}s after "
+            f"{result.attempts} attempt(s) "
+            f"(last_command={result.last_command!r}).\n"
+            + om.hang_recovery_hint(result),
             code=1,
         )
 
     nodes = om.parse_lsext(result.stdout)
     if not nodes:
+        # The wrapper has the list but it was empty — could mean path
+        # doesn't exist, OR the listing produced output the parser didn't
+        # recognise. Surface the raw stdout tail so the user can see what
+        # mtp-cli actually emitted.
+        tail = result.stdout.strip()[-500:]
         om.die(
             f"no entries returned for path {args.path!r}. Check that the path "
-            f"exists and that the device is unlocked.",
+            f"exists and that the device is unlocked. Raw mtp-cli output "
+            f"(last 500 chars):\n{tail}",
             code=1,
         )
 

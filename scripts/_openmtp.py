@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, NoReturn, Optional, Sequence
@@ -87,12 +88,58 @@ def find_mtp_cli(override: Optional[str] = None) -> Path:
 
 @dataclass
 class MTPResult:
-    """Result of one batch-mode mtp-cli invocation."""
+    """Result of one batch-mode mtp-cli invocation.
+
+    Attributes:
+        stdout: Whatever mtp-cli printed to stdout before exit/timeout/kill.
+        stderr: Whatever mtp-cli printed to stderr. IOKit errors (e.g.
+            ``IOCreatePlugInInterfaceForService: error 0xe00002be``) and
+            "no mtp device found" land here.
+        timed_out: True if :func:`subprocess.communicate` raised
+            ``TimeoutExpired`` (the wrapper killed the child and reaped it).
+        exit_code: mtp-cli's exit code (or ``-1`` if killed by the wrapper).
+        attempts: How many times :func:`run_mtp` actually invoked mtp-cli.
+            > 1 means at least one retry was used.
+        last_command: The last command (or first line of the joined
+            commands sequence) the wrapper was feeding mtp-cli when this
+            result was produced. Useful for diagnostics when a hang
+            occurs deep in a sequence like ``device-info / select-storage
+            / lsext-r``.
+    """
 
     stdout: str
     stderr: str
     timed_out: bool
     exit_code: int
+    attempts: int = 1
+    last_command: str = ""
+
+
+def hang_recovery_hint(result: MTPResult) -> str:
+    """Return a one-line human hint to recover from a hang / IOKit stall.
+
+    Called by the CLI scripts when ``result.timed_out`` or when stderr
+    shows the canonical ``IOCreatePlugInInterfaceForService: error
+    0xe00002be`` pattern. The hint points at the two known recovery
+    steps (replug the cable, or ``sudo killall -HUP usbd`` to refresh
+    the macOS USB stack).
+    """
+    cmd = f" while running {result.last_command!r}" if result.last_command else ""
+    return (
+        "mtp-cli did not return within the timeout"
+        f"{cmd}. Recovery on macOS:\n"
+        "  1. Unplug and replug the USB cable (lets the phone re-enumerate\n"
+        "     its MTP endpoints).\n"
+        "  2. If that does not help: 'sudo killall -HUP usbd' forces the\n"
+        "     macOS USB daemon to re-enumerate. Requires sudo; briefly\n"
+        "     disconnects other USB devices.\n"
+        "  3. Toggle the phone's USB mode (Settings → USB preferences) from\n"
+        "     'Charging only' to 'File transfer / MTP' (or vice versa) to\n"
+        "     trigger a fresh USB role-switch.\n"
+        "  4. As a last resort, restart the Mac.\n"
+        "Pass --retry-on-hang N to have the wrapper retry the call N times\n"
+        "after killing mtp-cli; useful when the hang is intermittent."
+    )
 
 
 def run_mtp(
@@ -101,6 +148,8 @@ def run_mtp(
     mtp_cli_path: Optional[Path] = None,
     timeout: float = 5.0,
     extra_args: Sequence[str] = (),
+    retries_on_hang: int = 0,
+    retry_sleep: float = 2.0,
 ) -> MTPResult:
     """Spawn mtp-cli in batch mode and run a sequence of commands.
 
@@ -113,6 +162,11 @@ def run_mtp(
     USB claim), ``-e`` (allow event processing), ``-R`` (reset device),
     ``-v`` (verbose), etc. Use ``run_mtp(extra_args=("-C",))``.
 
+    ``retries_on_hang`` is the number of times to retry on
+    ``subprocess.TimeoutExpired``. Each retry waits ``retry_sleep`` seconds
+    to let the USB stack / IOKit cache settle before the next attempt.
+    Non-zero exit codes are NOT retried — those mean "mtp-cli ran, refused".
+
     A timeout is normal when no Android device is plugged in or the device is
     not in MTP mode — ``mtp-cli`` will sit waiting on libusb for a device.
     Callers should check ``timed_out`` and report a friendly message instead
@@ -121,25 +175,51 @@ def run_mtp(
     path = mtp_cli_path or find_mtp_cli()
     payload = "\n".join(commands) + "\nquit\n"
     argv = [str(path), "-b", *extra_args]
+    last_command = commands[0] if commands else ""
+    attempts_total = 0
 
-    try:
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except FileNotFoundError as e:
-        raise FileNotFoundError(f"mtp-cli not executable at {path}: {e}") from e
+    for attempt in range(retries_on_hang + 1):
+        attempts_total += 1
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"mtp-cli not executable at {path}: {e}") from e
 
-    try:
-        stdout, stderr = proc.communicate(input=payload, timeout=timeout)
-        return MTPResult(stdout=stdout, stderr=stderr, timed_out=False, exit_code=proc.returncode)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
-        return MTPResult(stdout=stdout, stderr=stderr, timed_out=True, exit_code=proc.returncode)
+        try:
+            stdout, stderr = proc.communicate(input=payload, timeout=timeout)
+            return MTPResult(
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=False,
+                exit_code=proc.returncode,
+                attempts=attempts_total,
+                last_command=last_command,
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            if attempt >= retries_on_hang:
+                return MTPResult(
+                    stdout=stdout,
+                    stderr=stderr,
+                    timed_out=True,
+                    exit_code=getattr(proc, "returncode", -1),
+                    attempts=attempts_total,
+                    last_command=last_command,
+                )
+            # Sleep then retry — the USB stack may need a moment to recover
+            # from whatever the previous attempt left half-done.
+            time.sleep(retry_sleep)
+
+    # Unreachable: the loop either returns or retries. The final iteration
+    # always returns via the timed_out branch. Keep this for type-checkers.
+    raise RuntimeError("run_mtp: unreachable")
 
 
 # -----------------------------------------------------------------------------
@@ -199,12 +279,16 @@ def detect_device(
     commands: Sequence[str] = ("version", "device-info", "storage-list"),
     attempts: Sequence[tuple[str, tuple[str, ...]]] = MTP_DETECT_ATTEMPTS,
     runner: Optional[Any] = None,
+    retries_on_hang: int = 0,
 ) -> DetectResult:
     """Try multiple mtp-cli flag combinations until one yields a device.
 
     Stops early on the first success or on the first timeout — timeouts are
     deterministic (no device on USB), so retrying with different flags does
     not help.
+
+    ``retries_on_hang`` is forwarded to :func:`run_mtp` so each attempt is
+    itself retried (with a sleep between attempts) when mtp-cli hangs.
 
     ``runner`` defaults to :func:`run_mtp`. Tests inject a fake runner that
     returns canned ``MTPResult`` values; production callers should leave it
@@ -220,6 +304,7 @@ def detect_device(
             mtp_cli_path=mtp_cli_path,
             timeout=timeout,
             extra_args=list(flags),
+            retries_on_hang=retries_on_hang,
         )
         return (
             label,

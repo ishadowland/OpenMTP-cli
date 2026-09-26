@@ -33,11 +33,11 @@ def _human_print_failure(detect: om.DetectResult, mtp_cli_path: Path, timeout: f
     print(f"Not connected ({len(detect.attempted)} attempt(s): {', '.join(detect.attempted)})", file=sys.stderr)
     if last.timed_out:
         print(
-            f"Error: mtp-cli did not respond within {timeout}s. "
-            "Likely causes: no Android device plugged in, USB mode not set "
-            "to 'File transfer / MTP', or device is locked.",
+            f"Error: mtp-cli did not respond within {timeout}s after "
+            f"{last.attempts} attempt(s) (last_command={last.last_command!r}).",
             file=sys.stderr,
         )
+        print(om.hang_recovery_hint(last), file=sys.stderr)
         return
     print(
         f"Error: mtp-cli returned no device-info or storage-list for any "
@@ -75,6 +75,14 @@ def main(argv: list[str] | None = None) -> int:
              "attempt only. Helpful when debugging mtp-cli flag interactions.",
     )
     parser.add_argument(
+        "--retry-on-hang",
+        type=int,
+        default=0,
+        metavar="N",
+        help="If mtp-cli hangs (no response within --timeout), kill it, wait, "
+             "and retry up to N times before giving up. Default: 0.",
+    )
+    parser.add_argument(
         "--no-json",
         action="store_true",
         help="Print human-readable text instead of JSON.",
@@ -96,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         mtp_cli_path=mtp_cli_path,
         timeout=args.timeout,
         attempts=attempts,
+        retries_on_hang=max(0, args.retry_on_hang),
     )
 
     if detect.connected:
@@ -130,14 +139,18 @@ def main(argv: list[str] | None = None) -> int:
         "device": None,
         "storages": [],
         "attempted": detect.attempted,
+        "mtp_cli_attempts": last.attempts,
+        "last_command": last.last_command,
     }
 
     if last.timed_out:
         payload["error"] = (
-            f"mtp-cli did not respond within {args.timeout}s. "
-            "Likely causes: no Android device plugged in, USB mode not set "
-            "to 'File transfer / MTP', or device is locked."
+            f"mtp-cli did not respond within {args.timeout}s after "
+            f"{last.attempts} attempt(s). Likely causes: no Android device "
+            f"plugged in, USB mode not set to 'File transfer / MTP', or "
+            f"device is locked."
         )
+        payload["recovery_hint"] = om.hang_recovery_hint(last)
     else:
         payload["error"] = (
             f"mtp-cli returned no device-info or storage-list for any of "

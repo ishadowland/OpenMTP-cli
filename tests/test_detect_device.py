@@ -25,7 +25,7 @@ def _stub_runner(scripted_results):
     queue = list(scripted_results)
     calls: list[tuple[str, ...]] = []
 
-    def runner(commands, *, mtp_cli_path, timeout, extra_args):
+    def runner(commands, *, mtp_cli_path, timeout, extra_args, retries_on_hang=0):
         calls.append(tuple(extra_args))
         if not queue:
             raise AssertionError("runner called more times than scripted")
@@ -175,3 +175,130 @@ class TestDetectDeviceDefaultChainShape:
         all_flags = [f for _, flags in om.MTP_DETECT_ATTEMPTS for f in flags]
         assert "-R" not in all_flags, "-R (reset device) is destructive; don't auto-retry"
         assert "-v" not in all_flags, "-v (verbose) shouldn't be in the default chain"
+
+
+class TestMTPResultShape:
+    """The MTPResult dataclass gained `attempts` and `last_command` so the
+    wrapper can tell the caller *which* command hung and *how many* retries
+    were spent. Lock that shape down."""
+
+    def test_attempts_defaults_to_one(self):
+        r = om.MTPResult(stdout="", stderr="", timed_out=False, exit_code=0)
+        assert r.attempts == 1
+        assert r.last_command == ""
+
+    def test_last_command_round_trips(self):
+        r = om.MTPResult(
+            stdout="", stderr="", timed_out=True, exit_code=-1,
+            attempts=3, last_command="lsext-r /DCIM",
+        )
+        assert r.attempts == 3
+        assert r.last_command == "lsext-r /DCIM"
+
+
+class TestRunMtpRetriesOnHang:
+    """``run_mtp(retries_on_hang=N)`` must retry when mtp-cli hangs, and
+    surface the total attempt count + last command in the result."""
+
+    @staticmethod
+    def _make_hang_proc(call_counter):
+        """Return a FakeProc subclass that hangs when ``timeout`` is given
+        (simulating a real mtp-cli hang) but returns empty data when called
+        without a timeout (simulating the post-``kill()`` reaping that
+        happens after the wrapper times out).
+        """
+        import subprocess as _sp
+
+        class FakeProc:
+            def __init__(self, *a, **kw):
+                call_counter["n"] += 1
+
+            def communicate(self, input=None, timeout=None):
+                if timeout is not None:
+                    raise _sp.TimeoutExpired("mtp-cli", timeout)
+                return ("", "")
+
+            def kill(self):
+                pass
+
+        return FakeProc
+
+    def test_no_retry_by_default(self, monkeypatch):
+        counter = {"n": 0}
+        monkeypatch.setattr(om.subprocess, "Popen", self._make_hang_proc(counter))
+        r = om.run_mtp(["lsext-r /DCIM"], timeout=1)
+        assert r.timed_out is True
+        assert r.attempts == 1
+        assert counter["n"] == 1
+
+    def test_retry_eventually_succeeds(self, monkeypatch):
+        # Hang the first two invocations; return data on the third.
+        # The post-kill communicate() (called by run_mtp with no timeout
+        # after TimeoutExpired) must return empty data, NOT re-raise.
+        import subprocess as _sp
+
+        state = {"n": 0}
+
+        class FakeProc:
+            returncode = 0
+
+            def __init__(self, *a, **kw):
+                state["n"] += 1
+                self.n = state["n"]
+
+            def communicate(self, input=None, timeout=None):
+                if timeout is not None and self.n < 3:
+                    # First / second call: simulate hang
+                    raise _sp.TimeoutExpired("mtp-cli", timeout)
+                # Third call (success) OR post-kill reaping: return data
+                if self.n >= 3:
+                    return ("data\n", "")
+                return ("", "")
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(om.subprocess, "Popen", FakeProc)
+        monkeypatch.setattr(om.time, "sleep", lambda _: None)
+
+        r = om.run_mtp(
+            ["lsext-r /DCIM"],
+            timeout=1,
+            retries_on_hang=2,
+        )
+        assert r.timed_out is False
+        assert r.attempts == 3  # initial + 2 retries
+        assert r.stdout == "data\n"
+
+    def test_retry_exhausts_and_returns_timed_out(self, monkeypatch):
+        counter = {"n": 0}
+        monkeypatch.setattr(om.subprocess, "Popen", self._make_hang_proc(counter))
+        monkeypatch.setattr(om.time, "sleep", lambda _: None)
+
+        r = om.run_mtp(
+            ["lsext-r /DCIM"],
+            timeout=1,
+            retries_on_hang=3,
+        )
+        assert r.timed_out is True
+        assert r.attempts == 4  # initial + 3 retries, all failed
+        assert r.last_command == "lsext-r /DCIM"
+
+    def test_last_command_is_first_command(self, monkeypatch):
+        counter = {"n": 0}
+        monkeypatch.setattr(om.subprocess, "Popen", self._make_hang_proc(counter))
+        r = om.run_mtp(["device-info", "select-storage 65537", "lsext-r /DCIM"])
+
+
+class TestHangRecoveryHint:
+    def test_hint_mentions_recovery_steps(self):
+        r = om.MTPResult(
+            stdout="", stderr="IOCreatePlugInInterfaceForService: error 0xe00002be",
+            timed_out=True, exit_code=-1,
+            attempts=3, last_command="lsext-r /DCIM",
+        )
+        hint = om.hang_recovery_hint(r)
+        assert "sudo killall -HUP usbd" in hint
+        assert "Unplug and replug the USB cable" in hint
+        assert "lsext-r /DCIM" in hint  # echoes the offending command
+        assert "--retry-on-hang" in hint

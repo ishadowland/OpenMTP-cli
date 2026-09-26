@@ -66,6 +66,42 @@ it doesn't:
 - Kill them: `pkill -9 mtp-cli`.
 - File an issue — the libusb teardown on this USB controller is buggy.
 
+### Recovery runbook (when hang sticks across invocations)
+
+Once mtp-cli has hung, the USB stack on macOS can be left in a half-stalled
+state where **every subsequent mtp-cli invocation hangs** — even for
+`device-info` — until the stack is reset. Recognise this when:
+
+- `ioreg -p IOUSB -l | grep -A 10 OnePlus` shows `kUSBProductString = ""`
+  (blank) and `IOGeneralInterest = "IOCommand is not serializable"`
+- `system_profiler SPUSBDataType` still sees the phone, but
+  `mtp-list` returns `connected: false` even on retry
+- `IOCreatePlugInInterfaceForService: error 0xe00002be` appears on stderr
+  every time
+
+**Step-by-step recovery**, in order of intrusiveness:
+
+1. **Wait 10 seconds.** The IOKit cache sometimes self-heals after a USB
+   role-switch. While waiting, confirm the phone is **unlocked** (Android
+   refuses MTP enumeration while the screen is locked).
+2. **Toggle the phone's USB mode.** Settings → USB preferences (or pull
+   down the notification shade after the USB plug-in notification) →
+   switch from "Charging only" to "File transfer / MTP" or vice versa.
+   This triggers a fresh USB role-switch that forces macOS to re-enumerate.
+3. **Unplug and replug the USB cable.** Lets the phone re-enumerate its
+   MTP endpoints cleanly.
+4. **Reset the macOS USB daemon** (`sudo killall -HUP usbd`). This forces
+   `usbd` to re-enumerate ALL USB devices; briefly disconnects other
+   peripherals. Requires sudo. This is the canonical fix when steps
+   1-3 don't work.
+5. **Restart the Mac.** Last resort.
+
+The wrapper also exposes `--retry-on-hang N` (default 0): on
+`subprocess.TimeoutExpired` the wrapper kills mtp-cli, waits 2 seconds,
+and retries up to N times before giving up. Useful for transient hangs.
+The JSON output (when `connected: false`) includes `mtp_cli_attempts`,
+`last_command`, and `recovery_hint` to point at the recovery steps above.
+
 ## 5. IOKit `0xe00002be` (`kIOReturnNoDevice`) in stderr but the device IS visible to OpenMTP.app
 
 Symptom (verbatim from issue #1):
