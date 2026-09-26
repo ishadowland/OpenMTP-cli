@@ -979,18 +979,22 @@ class MTPSession:
     ) -> list[str]:
         """Run a silent command (``get`` / ``put``) and detect completion.
 
-        Transfers produce no stdout, so the quiet-gap heuristic cannot tell
-        "still transferring" from "finished". Instead we queue a probe
-        command (``pwd`` by default) right after the transfer command: mtp-cli
-        processes stdin strictly in order, so the FIRST stdout line received
-        after queuing is the probe's response — meaning the transfer finished.
+        Transfers produce no stdout on success, so the quiet-gap heuristic
+        cannot tell "still transferring" from "finished". Instead we queue a
+        probe command (``pwd`` by default) right after the transfer command:
+        mtp-cli processes stdin strictly in order, so the probe's response is
+        the LAST stdout line — anything before it is the transfer's own
+        (error) output.
 
-        Returns the probe's output lines (empty strings filtered out) plus
-        anything the transfer itself printed (usually nothing, or an error).
+        The probe's response is recognised as a line starting with ``/`` (an
+        absolute path). A transfer error line (``error: ...``) is collected
+        into a RuntimeError so callers see WHY the transfer failed instead of
+        silently treating it as done.
 
         Raises ``TimeoutError`` if the probe never responds within
         ``timeout`` seconds — the transfer (or the session) is stuck; the
-        caller should abandon this session.
+        caller should abandon this session. Raises ``RuntimeError`` if the
+        transfer itself printed an error.
         """
         if self.proc.poll() is not None:
             raise RuntimeError(f"mtp-cli session exited early (code {self.proc.returncode})")
@@ -998,20 +1002,36 @@ class MTPSession:
         self.proc.stdin.write(probe + "\n")
         self.proc.stdin.flush()
 
-        lines: list[str] = []
+        errors: list[str] = []
+        probe_lines: list[str] = []
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             events = self._sel.select(0.2)
             for key, _ in events:
                 line = key.fileobj.readline()
-                if line and line.strip():
-                    lines.append(line.rstrip("\n"))
-            if lines:
-                # First non-empty output = the probe responded → done.
-                return lines
+                if not line or not line.strip():
+                    continue
+                stripped = line.rstrip("\n")
+                if stripped.lstrip().lower().startswith("/") or stripped == "/":
+                    # Absolute path = pwd's response → transfer finished.
+                    probe_lines.append(stripped)
+                elif stripped.lower().startswith("error"):
+                    errors.append(stripped)
+                else:
+                    # Unknown non-empty line — treat conservatively as an
+                    # error signature unless a later probe line follows.
+                    errors.append(stripped)
+            if probe_lines:
+                if errors:
+                    raise RuntimeError(
+                        f"{command.split()[0] if command.split() else command} failed: "
+                        + "; ".join(errors[:3])
+                    )
+                return probe_lines
             if self.proc.poll() is not None:
                 raise RuntimeError(
                     f"mtp-cli died (code {self.proc.returncode}) while running {command!r}"
+                    + (f": {'; '.join(errors[:3])}" if errors else "")
                 )
         raise TimeoutError(
             f"{command.split()[0] if command.split() else command} did not complete "
